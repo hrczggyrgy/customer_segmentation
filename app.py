@@ -4,40 +4,37 @@ import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
 import io
+import warnings
+warnings.filterwarnings('ignore')
+
+# Import segmentation pipeline
+from segmentation import AdvancedCustomerSegmentation
 
 # 1. Page Configuration
 st.set_page_config(page_title="Advanced Customer Analytics", layout="wide")
 st.title("Customer Intelligence Platform")
 
-# 2. File Upload (for Streamlit Cloud deployment)
-st.sidebar.header("📁 Data Upload")
-st.sidebar.markdown("Upload your own parquet files, or use the built-in sample data.")
+# Initialize session state
+if 'segments_df' not in st.session_state:
+    st.session_state.segments_df = None
+if 'tx_df' not in st.session_state:
+    st.session_state.tx_df = None
+if 'segments_generated' not in st.session_state:
+    st.session_state.segments_generated = False
 
-uploaded_segments = st.sidebar.file_uploader(
-    "Segments Parquet (customer_segments_advanced.parquet)",
-    type=["parquet"],
-    help="Output from segmentation.py with PCA components"
-)
+# 2. File Upload (for Streamlit Cloud deployment) - ONLY TRANSACTIONS NEEDED
+st.sidebar.header("📁 Data Upload")
+st.sidebar.markdown("""
+Upload **cleaned transaction data** only. The app will generate segments on demand.
+""")
 
 uploaded_transactions = st.sidebar.file_uploader(
     "Transactions Parquet (customer_transactions_clean.parquet)",
     type=["parquet"],
-    help="Cleaned transaction data for cohort analysis"
+    help="Cleaned transaction data - the app will generate segments automatically"
 )
 
-# 3. Data Loaders (Cached for performance) - Keep in Polars!
-@st.cache_data
-def load_segments_from_file(uploaded_file):
-    """Load segments from uploaded file or local fallback."""
-    if uploaded_file is not None:
-        return pl.read_parquet(io.BytesIO(uploaded_file.read()))
-    # Fallback to local file
-    try:
-        return pl.read_parquet("customer_segments_advanced.parquet")
-    except FileNotFoundError:
-        st.error("No segments file found. Please upload a parquet file or place 'customer_segments_advanced.parquet' in the app directory.")
-        st.stop()
-
+# Load transactions (with local fallback)
 @st.cache_data
 def load_transactions_from_file(uploaded_file):
     """Load transactions from uploaded file or local fallback."""
@@ -47,8 +44,32 @@ def load_transactions_from_file(uploaded_file):
     try:
         return pl.read_parquet("customer_transactions_clean.parquet")
     except FileNotFoundError:
-        st.warning("No transactions file found. Cohort retention will be unavailable. Upload 'customer_transactions_clean.parquet' or place it locally.")
+        st.warning("No transactions file found. Please upload a parquet file.")
         return None
+
+# Load or generate segments
+def get_or_generate_segments(tx_df):
+    """Load existing segments or generate new ones from transactions."""
+    # Try to load local segments file first
+    try:
+        segments = pl.read_parquet("customer_segments_advanced.parquet")
+        st.sidebar.success("✅ Loaded existing segments from local file")
+        return segments
+    except FileNotFoundError:
+        pass
+    
+    # If no local file, run pipeline on provided transactions
+    if tx_df is not None:
+        with st.spinner("Running segmentation pipeline (Winsorization → RobustScaler → PCA → KMeans)... This takes ~30-60 seconds."):
+            pipeline = AdvancedCustomerSegmentation(max_clusters=8, n_components=6)
+            segments = pipeline.fit_predict(tx_df)
+            # Save to local file for future runs
+            segments.write_parquet("customer_segments_advanced.parquet")
+            st.sidebar.success("✅ Segments generated and saved!")
+            return segments
+    
+    st.error("No transaction data available. Please upload a parquet file.")
+    st.stop()
 
 @st.cache_data
 def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFrame:
@@ -93,7 +114,6 @@ def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFr
     
     # Normalize each period by its cohort's Month 0 customer count
     period_cols = [c for c in cohort_pivot.columns if c != 'CohortMonth' and isinstance(c, (int, str))]
-    # Convert string period cols to int for sorting
     period_cols_int = []
     for c in period_cols:
         try:
@@ -106,7 +126,6 @@ def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFr
         # Get Month 0 cohort sizes (column names are strings in Polars)
         if 0 in period_cols_int:
             cohort_sizes = cohort_pivot.select(pl.col("0")).to_series()
-            # Normalize each period
             for pc in period_cols_int:
                 pc_str = str(pc)
                 if pc != 0:
@@ -125,10 +144,44 @@ def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFr
     new_cols = ['Cohort'] + [str(pc) for pc in period_cols_int]
     return cohort_pivot.select(new_cols)
 
-# Load data (LazyFrame for transactions, DataFrame for segments)
-segments_df = load_segments_from_file(uploaded_segments)
-tx_df = load_transactions_from_file(uploaded_transactions)
-tx_lazy = tx_df.lazy() if tx_df is not None else None
+# ============================================================
+# MAIN DATA LOADING LOGIC
+# ============================================================
+
+# Load transactions
+if uploaded_transactions is not None or st.session_state.tx_df is not None:
+    if uploaded_transactions is not None:
+        # New upload - load it
+        tx_df = pl.read_parquet(io.BytesIO(uploaded_transactions.read()))
+        st.session_state.tx_df = tx_df
+        st.session_state.segments_generated = False  # Reset segments flag
+    else:
+        # Use session state
+        tx_df = st.session_state.tx_df
+else:
+    # Try local file
+    try:
+        tx_df = pl.read_parquet("customer_transactions_clean.parquet")
+        st.session_state.tx_df = tx_df
+    except FileNotFoundError:
+        st.error("No transaction data available. Please upload a parquet file.")
+        st.stop()
+
+tx_lazy = tx_df.lazy()
+
+# Generate or load segments
+if not st.session_state.segments_generated or st.session_state.segments_df is None:
+    # Show generate button
+    if st.sidebar.button("🔄 Generate / Refresh Segments", type="primary"):
+        segments_df = get_or_generate_segments(tx_df)
+        st.session_state.segments_df = segments_df
+        st.session_state.segments_generated = True
+        st.rerun()
+    else:
+        st.info("👈 Click **'Generate / Refresh Segments'** in the sidebar to run the segmentation pipeline.")
+        st.stop()
+else:
+    segments_df = st.session_state.segments_df
 
 # Add Primary_Category_Name if missing (derive from transactions in Polars)
 if 'Primary_Category_Name' not in segments_df.columns:
@@ -142,6 +195,8 @@ if 'Primary_Category_Name' not in segments_df.columns:
     segments_df = segments_df.with_columns(
         pl.col('Primary_Category_Name').fill_null('Unknown')
     )
+    # Update session state
+    st.session_state.segments_df = segments_df
 
 # ============================================================
 # SHARED CLUSTER COLOR MAPPING & HELPERS
@@ -178,7 +233,7 @@ def filter_empty_warning(filtered_df: pl.DataFrame) -> bool:
 # ============================================================
 
 # Sidebar Filters
-st.sidebar.header("Global Filters")
+st.sidebar.header("🎯 Global Filters")
 selected_clusters = st.sidebar.multiselect(
     "Select Clusters", 
     clusters, 
@@ -565,7 +620,6 @@ with tab4:
         st.plotly_chart(fig_pca, use_container_width=True)
         
         if show_explained:
-            # Get explained variance from the pipeline (we'd need to save it; approximate for now)
             st.info("""
             **PCA Explained Variance (from training):**
             - PC1: ~35-40% (Spend & Volume axis)
@@ -576,15 +630,14 @@ with tab4:
             *Loadings not currently exported; axis labels are interpretive.*
             """)
     else:
-        st.warning("PCA components (PC1, PC2, PC3) not found in segment data. Re-run segmentation.py to generate them.")
+        st.warning("PCA components (PC1, PC2, PC3) not found in segment data. Re-run segmentation to generate them.")
 
 # ------------------------------------------------------------------
 # COHORT RETENTION (Sidebar toggle to avoid heavy compute)
 # ------------------------------------------------------------------
 st.sidebar.markdown("---")
-
 if tx_lazy is None:
-    st.sidebar.warning("⚠️ No transactions data uploaded. Cohort retention unavailable.")
+    st.sidebar.warning("⚠️ No transactions data loaded. Cohort retention unavailable.")
 else:
     if st.sidebar.button("Generate Monthly Repeat-Purchase Retention"):
         with st.spinner("Computing cohort retention..."):
