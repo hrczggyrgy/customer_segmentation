@@ -293,6 +293,39 @@ class AdvancedCustomerSegmentation:
         
         return result
 
+    def get_pca_metadata(self) -> dict:
+        """Return PCA metadata for interpretability."""
+        if self._pca_explained_variance is None:
+            return {}
+        return {
+            'explained_variance_ratio': self._pca_explained_variance,
+            'explained_variance_cumulative': np.cumsum(self._pca_explained_variance).tolist(),
+            'loadings': self._pca_loadings,
+            'feature_names': self._feature_names,
+            'n_components': self.n_components,
+            'optimal_k': self.optimal_k,
+        }
+
+    def save_metadata(self, path: str = "pca_metadata.json"):
+        """Save PCA metadata to JSON file."""
+        import json
+        metadata = self.get_pca_metadata()
+        # Convert numpy types to Python types for JSON serialization
+        def convert(obj):
+            if isinstance(obj, (np.integer, np.floating)):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, list):
+                return [convert(item) for item in obj]
+            elif isinstance(obj, dict):
+                return {k: convert(v) for k, v in obj.items()}
+            return obj
+        metadata = convert(metadata)
+        with open(path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        print(f"   -> PCA metadata saved to {path}")
+
 
 # ==========================================
 # Example Usage
@@ -305,4 +338,9 @@ if __name__ == "__main__":
     
     # Save directly from Polars
     segmented_customers.write_parquet("customer_segments_advanced.parquet")
+    
+    # Save PCA metadata for dashboard interpretability
+    pipeline.save_metadata("pca_metadata.json")
+    
     print("\nSaved segments to customer_segments_advanced.parquet")
+    print("Saved PCA metadata to pca_metadata.json")

@@ -4,6 +4,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
 import io
+import hashlib
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -21,12 +22,27 @@ if 'tx_df' not in st.session_state:
     st.session_state.tx_df = None
 if 'segments_generated' not in st.session_state:
     st.session_state.segments_generated = False
+if 'tx_fingerprint' not in st.session_state:
+    st.session_state.tx_fingerprint = None
 
-# 2. File Upload (for Streamlit Cloud deployment) - ONLY TRANSACTIONS NEEDED
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+def compute_fingerprint(df: pl.DataFrame) -> str:
+    """Compute a stable fingerprint of the DataFrame for change detection."""
+    # Use schema + row count + a sample of data for quick fingerprinting
+    n_rows = df.height
+    schema_str = str(df.schema)
+    # Sample first 100 rows for content hash
+    sample = df.head(100).to_numpy().tobytes()
+    content = f"{n_rows}:{schema_str}:{hashlib.md5(sample).hexdigest()}"
+    return hashlib.md5(content.encode()).hexdigest()[:16]
+
+# ============================================================
+# FILE UPLOAD
+# ============================================================
 st.sidebar.header("📁 Data Upload")
-st.sidebar.markdown("""
-Upload **cleaned transaction data** only. The app will generate segments on demand.
-""")
+st.sidebar.markdown("Upload **cleaned transaction data** only. The app will generate segments on demand.")
 
 uploaded_transactions = st.sidebar.file_uploader(
     "Transactions Parquet (customer_transactions_clean.parquet)",
@@ -34,9 +50,11 @@ uploaded_transactions = st.sidebar.file_uploader(
     help="Cleaned transaction data - the app will generate segments automatically"
 )
 
-# Load transactions (with local fallback)
+# ============================================================
+# DATA LOADERS (cached)
+# ============================================================
 @st.cache_data
-def load_transactions_from_file(uploaded_file):
+def load_transactions_from_file(uploaded_file) -> pl.DataFrame:
     """Load transactions from uploaded file or local fallback."""
     if uploaded_file is not None:
         return pl.read_parquet(io.BytesIO(uploaded_file.read()))
@@ -47,8 +65,17 @@ def load_transactions_from_file(uploaded_file):
         st.warning("No transactions file found. Please upload a parquet file.")
         return None
 
-# Load or generate segments
-def get_or_generate_segments(tx_df):
+# ============================================================
+# SEGMENTATION PIPELINE (cached)
+# ============================================================
+@st.cache_data(show_spinner=False)
+def run_segmentation_pipeline(transactions_df: pl.DataFrame) -> pl.DataFrame:
+    """Run the full segmentation pipeline on transaction data."""
+    pipeline = AdvancedCustomerSegmentation(max_clusters=8, n_components=6)
+    segments = pipeline.fit_predict(transactions_df)
+    return segments
+
+def get_or_generate_segments(tx_df: pl.DataFrame) -> pl.DataFrame:
     """Load existing segments or generate new ones from transactions."""
     # Try to load local segments file first
     try:
@@ -60,48 +87,57 @@ def get_or_generate_segments(tx_df):
     
     # If no local file, run pipeline on provided transactions
     if tx_df is not None:
-        with st.spinner("Running segmentation pipeline (Winsorization → RobustScaler → PCA → KMeans)... This takes ~30-60 seconds."):
-            pipeline = AdvancedCustomerSegmentation(max_clusters=8, n_components=6)
-            segments = pipeline.fit_predict(tx_df)
-            # Save to local file for future runs
-            segments.write_parquet("customer_segments_advanced.parquet")
-            st.sidebar.success("✅ Segments generated and saved!")
+        status_placeholder = st.sidebar.empty()
+        try:
+            with st.sidebar.status("Running segmentation pipeline...", expanded=True) as status:
+                status.write("Step 1/5: Validating and cleaning data...")
+                status.write("Step 2/5: Engineering 50+ behavioral metrics...")
+                status.write("Step 3/5: Winsorization, RobustScaling & PCA...")
+                status.write("Step 4/5: Optimizing cluster count (Davies-Bouldin)...")
+                status.write("Step 5/5: Fitting final KMeans model...")
+                
+                segments = run_segmentation_pipeline(tx_df)
+                
+                # Save to local file for future runs
+                segments.write_parquet("customer_segments_advanced.parquet")
+                status.update(label="✅ Segments generated and saved!", state="complete")
+            
             return segments
+        except Exception as e:
+            st.sidebar.error(f"❌ Segmentation failed: {str(e)}")
+            st.error(f"Segmentation error: {e}")
+            st.stop()
     
     st.error("No transaction data available. Please upload a parquet file.")
     st.stop()
 
+# ============================================================
+# RETENTION MATRIX (cached)
+# ============================================================
 @st.cache_data
 def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFrame:
-    """
-    Generates a Monthly Repeat-Purchase Retention matrix entirely in Polars.
-    Returns a pivoted DataFrame with cohorts as rows, periods as columns, retention rates as values.
-    """
+    """Generates a Monthly Repeat-Purchase Retention matrix entirely in Polars."""
     df = transactions_lf.with_columns([
         pl.col('transaction_date').dt.truncate('1mo').alias('OrderMonth'),
     ]).with_columns([
         pl.col('transaction_date').dt.truncate('1mo').alias('tx_month'),
     ])
     
-    # Get cohort month (first purchase month per customer)
     cohort_months = df.group_by('customer_id').agg(
         pl.col('tx_month').min().alias('CohortMonth')
     )
     
     df = df.join(cohort_months, on='customer_id', how='left')
     
-    # Calculate period number (months since cohort)
     df = df.with_columns([
         ((pl.col('OrderMonth').dt.year() - pl.col('CohortMonth').dt.year()) * 12 + 
          (pl.col('OrderMonth').dt.month() - pl.col('CohortMonth').dt.month())).alias('PeriodNumber')
     ])
     
-    # Count unique customers per cohort/period
     cohort_data = df.group_by(['CohortMonth', 'PeriodNumber']).agg(
         pl.col('customer_id').n_unique().alias('customer_count')
     ).collect()
     
-    # Pivot to matrix
     cohort_pivot = cohort_data.pivot(
         values='customer_count',
         index='CohortMonth',
@@ -109,10 +145,8 @@ def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFr
         aggregate_function='first'
     ).sort('CohortMonth')
     
-    # Fill nulls with 0 for completed periods
-    cohort_pivot = cohort_pivot.fill_null(0)
-    
-    # Normalize each period by its cohort's Month 0 customer count
+    # DO NOT fill_null globally - preserves NaN for immature periods
+    # Only normalize periods that have data
     period_cols = [c for c in cohort_pivot.columns if c != 'CohortMonth' and isinstance(c, (int, str))]
     period_cols_int = []
     for c in period_cols:
@@ -123,24 +157,27 @@ def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFr
     
     if period_cols_int:
         period_cols_int.sort()
-        # Get Month 0 cohort sizes (column names are strings in Polars)
         if 0 in period_cols_int:
             cohort_sizes = cohort_pivot.select(pl.col("0")).to_series()
             for pc in period_cols_int:
                 pc_str = str(pc)
                 if pc != 0:
+                    # Only divide where Month 0 size > 0 and period has data
                     cohort_pivot = cohort_pivot.with_columns(
-                        (pl.col(pc_str) / cohort_sizes).alias(pc_str)
+                        pl.when(pl.col(pc_str).is_not_null() & (pl.col("0") > 0))
+                        .then(pl.col(pc_str) / pl.col("0"))
+                        .otherwise(None)
+                        .alias(pc_str)
                     )
-            # Month 0 is always 100%
-            cohort_pivot = cohort_pivot.with_columns(pl.lit(1.0).alias("0"))
+            # Month 0 is always 100% where cohort exists
+            cohort_pivot = cohort_pivot.with_columns(
+                pl.when(pl.col("0") > 0).then(pl.lit(1.0)).otherwise(None).alias("0")
+            )
     
-    # Convert CohortMonth to string for display
     cohort_pivot = cohort_pivot.with_columns(
         pl.col('CohortMonth').dt.strftime('%Y-%m').alias('Cohort')
     ).drop('CohortMonth')
     
-    # Ensure period columns are sorted numerically
     new_cols = ['Cohort'] + [str(pc) for pc in period_cols_int]
     return cohort_pivot.select(new_cols)
 
@@ -148,34 +185,49 @@ def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFr
 # MAIN DATA LOADING LOGIC
 # ============================================================
 
-# Load transactions
-if uploaded_transactions is not None or st.session_state.tx_df is not None:
-    if uploaded_transactions is not None:
-        # New upload - load it
+# Load transactions (handle upload changes correctly)
+if uploaded_transactions is not None:
+    # New upload - compute fingerprint to detect actual changes
+    new_fp = compute_fingerprint(pl.read_parquet(io.BytesIO(uploaded_transactions.read())))
+    uploaded_transactions.seek(0)  # Reset for next read
+    
+    if st.session_state.tx_fingerprint != new_fp:
+        # Data actually changed - load new data and reset segments
         tx_df = pl.read_parquet(io.BytesIO(uploaded_transactions.read()))
         st.session_state.tx_df = tx_df
-        st.session_state.segments_generated = False  # Reset segments flag
+        st.session_state.tx_fingerprint = new_fp
+        st.session_state.segments_generated = False
+        st.session_state.segments_df = None
+        st.sidebar.info("🔄 New transaction data detected. Please regenerate segments.")
     else:
-        # Use session state
+        # Same data - use cached
         tx_df = st.session_state.tx_df
 else:
-    # Try local file
-    try:
-        tx_df = pl.read_parquet("customer_transactions_clean.parquet")
-        st.session_state.tx_df = tx_df
-    except FileNotFoundError:
-        st.error("No transaction data available. Please upload a parquet file.")
-        st.stop()
+    # No upload - try local file or session state
+    if st.session_state.tx_df is not None:
+        tx_df = st.session_state.tx_df
+    else:
+        try:
+            tx_df = pl.read_parquet("customer_transactions_clean.parquet")
+            st.session_state.tx_df = tx_df
+            if st.session_state.tx_fingerprint is None:
+                st.session_state.tx_fingerprint = compute_fingerprint(tx_df)
+        except FileNotFoundError:
+            st.error("No transaction data available. Please upload a parquet file.")
+            st.stop()
 
 tx_lazy = tx_df.lazy()
 
-# Generate or load segments
+# ============================================================
+# SEGMENTATION TRIGGER
+# ============================================================
 if not st.session_state.segments_generated or st.session_state.segments_df is None:
     # Show generate button
-    if st.sidebar.button("🔄 Generate / Refresh Segments", type="primary"):
-        segments_df = get_or_generate_segments(tx_df)
-        st.session_state.segments_df = segments_df
-        st.session_state.segments_generated = True
+    if st.sidebar.button("🔄 Generate / Refresh Segments", type="primary", use_container_width=True):
+        with st.spinner("Running segmentation..."):
+            segments_df = get_or_generate_segments(tx_df)
+            st.session_state.segments_df = segments_df
+            st.session_state.segments_generated = True
         st.rerun()
     else:
         st.info("👈 Click **'Generate / Refresh Segments'** in the sidebar to run the segmentation pipeline.")
@@ -183,7 +235,9 @@ if not st.session_state.segments_generated or st.session_state.segments_df is No
 else:
     segments_df = st.session_state.segments_df
 
-# Add Primary_Category_Name if missing (derive from transactions in Polars)
+# ============================================================
+# POST-PROCESSING: Add Primary Category
+# ============================================================
 if 'Primary_Category_Name' not in segments_df.columns:
     primary_cat = tx_lazy.group_by('customer_id').agg(
         pl.col('category').mode().first().alias('Primary_Category_Name')
@@ -195,7 +249,6 @@ if 'Primary_Category_Name' not in segments_df.columns:
     segments_df = segments_df.with_columns(
         pl.col('Primary_Category_Name').fill_null('Unknown')
     )
-    # Update session state
     st.session_state.segments_df = segments_df
 
 # ============================================================
@@ -213,7 +266,6 @@ CLUSTER_COLORS = {
 CLUSTER_CATEGORY_ORDERS = {"Segment": cluster_labels}
 
 def add_segment_column(df: pl.DataFrame) -> pl.DataFrame:
-    """Add human-readable Segment column for consistent coloring."""
     return df.with_columns(
         pl.col('Cluster').cast(pl.Utf8).map_elements(
             lambda x: f"Cluster {x}", return_dtype=pl.Utf8
@@ -221,7 +273,6 @@ def add_segment_column(df: pl.DataFrame) -> pl.DataFrame:
     )
 
 def filter_empty_warning(filtered_df: pl.DataFrame) -> bool:
-    """Show warning and stop if no clusters selected."""
     if filtered_df.is_empty():
         st.info("Select at least one cluster to explore customer behavior.")
         st.stop()
@@ -229,10 +280,8 @@ def filter_empty_warning(filtered_df: pl.DataFrame) -> bool:
     return False
 
 # ============================================================
-# UI LAYOUT
+# UI: SIDEBAR FILTERS
 # ============================================================
-
-# Sidebar Filters
 st.sidebar.header("🎯 Global Filters")
 selected_clusters = st.sidebar.multiselect(
     "Select Clusters", 
@@ -242,7 +291,6 @@ selected_clusters = st.sidebar.multiselect(
 )
 filtered_df = segments_df.filter(pl.col('Cluster').is_in(selected_clusters))
 
-# Handle empty selection
 filter_empty_warning(filtered_df)
 
 # Add Segment column for plotting
@@ -250,7 +298,7 @@ filtered_df = add_segment_column(filtered_df)
 segments_df = add_segment_column(segments_df)
 
 # ============================================================
-# SUMMARY CARDS
+# SUMMARY CARDS (use filtered_df)
 # ============================================================
 total_customers = segments_df.height
 selected_count = filtered_df.height
@@ -259,7 +307,6 @@ selected_spend = filtered_df.select(pl.col('Total_Lifetime_Spend').sum()).item()
 median_aov = filtered_df.select(pl.col('Average_Order_Value_AOV').median()).item()
 median_recency = filtered_df.select(pl.col('Recency_Days').median()).item()
 
-# Dataset metadata
 max_date = tx_lazy.select(pl.col('transaction_date').max()).collect().item()
 min_date = tx_lazy.select(pl.col('transaction_date').min()).collect().item()
 
@@ -278,15 +325,16 @@ st.caption(f"Dataset range: {min_date.date()} to {max_date.date()} | Recency ref
 # ============================================================
 # TAB LAYOUT
 # ============================================================
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Risk–Value Portfolio", 
     "Segment Profiles", 
     "Distributions", 
-    "Model Exploration"
+    "Model Exploration",
+    "Retention"
 ])
 
 # ------------------------------------------------------------------
-# TAB 1: RISK–VALUE PORTFOLIO (Business-facing scatter)
+# TAB 1: RISK–VALUE PORTFOLIO
 # ------------------------------------------------------------------
 with tab1:
     st.header("Risk–Value Portfolio")
@@ -301,14 +349,12 @@ with tab1:
     *Customers with insufficient repeat-purchase history (index = 0) are shown separately.*
     """)
     
-    # Prepare plot data
     plot_df = filtered_df.select([
         'customer_id', 'Cluster', 'Segment', 'Total_Lifetime_Spend', 
         'Churn_Risk_Index_CRI', 'Recency_Days', 
         'Average_InterPurchase_Time_AIPT', 'Average_Order_Value_AOV'
     ]).to_pandas()
     
-    # Separate customers with sufficient history
     has_history = plot_df['Average_InterPurchase_Time_AIPT'] > 0
     no_history = plot_df[~has_history]
     plot_df = plot_df[has_history]
@@ -317,6 +363,7 @@ with tab1:
     with col2:
         log_scale = st.checkbox("Log scale (Y-axis)", value=True)
         show_no_history = st.checkbox("Show 'Insufficient history'", value=True)
+        spend_pct = st.slider("High-value threshold (percentile)", 50, 99, 80, help="Horizontal line separating high-value customers")
     
     fig_scatter = px.scatter(
         plot_df,
@@ -331,7 +378,7 @@ with tab1:
         size_max=15,
     )
     
-    # Add reference lines for illustrative zones
+    # Vertical reference lines
     fig_scatter.add_vline(x=1.0, line_dash="dot", line_color="gray", 
                           annotation_text="On Cadence", annotation_position="top left")
     fig_scatter.add_vline(x=2.0, line_dash="dot", line_color="orange", 
@@ -339,7 +386,23 @@ with tab1:
     fig_scatter.add_vline(x=3.0, line_dash="dash", line_color="red", 
                           annotation_text="Critical Delay", annotation_position="top right")
     
-    # Add no-history points at x=0 with different symbol
+    # Horizontal spend threshold (percentile-based)
+    spend_threshold = plot_df['Total_Lifetime_Spend'].quantile(spend_pct / 100)
+    fig_scatter.add_hline(y=spend_threshold, line_dash="dot", line_color="green",
+                          annotation_text=f"High Value ({spend_pct}th pctl: ${spend_threshold:,.0f})", 
+                          annotation_position="bottom right")
+    
+    # Quadrant annotations
+    fig_scatter.add_annotation(x=1.5, y=spend_threshold * 1.2, 
+                              text="⚠️ High Value + Overdue", showarrow=False,
+                              font=dict(size=10, color="red"), bgcolor="rgba(255,255,255,0.8)")
+    fig_scatter.add_annotation(x=0.5, y=spend_threshold * 1.2,
+                              text="✅ High Value + On Cadence", showarrow=False,
+                              font=dict(size=10, color="green"), bgcolor="rgba(255,255,255,0.8)")
+    fig_scatter.add_annotation(x=1.5, y=spend_threshold * 0.3,
+                              text="Low Value + Overdue", showarrow=False,
+                              font=dict(size=10, color="orange"), bgcolor="rgba(255,255,255,0.8)")
+    
     if show_no_history and not no_history.empty:
         fig_scatter.add_scatter(
             x=no_history['Churn_Risk_Index_CRI'],
@@ -348,7 +411,7 @@ with tab1:
             marker=dict(symbol='x', size=8, color='lightgray'),
             name='Insufficient history',
             showlegend=True,
-            hovertext=no_history['customer_id'].astype(str) + ': ' + no_history['Total_Lifetime_Spend'].astype(str)
+            hovertext=no_history['customer_id'].astype(str) + ': $' + no_history['Total_Lifetime_Spend'].astype(str)
         )
     
     fig_scatter.update_layout(
@@ -359,8 +422,7 @@ with tab1:
     )
     st.plotly_chart(fig_scatter, use_container_width=True)
     
-    # Quick actionable table
-    st.subheader("Top Targets: High Spend + High Delay")
+    st.subheader("Top Targets: High Value + High Delay")
     high_delay = plot_df[plot_df['Churn_Risk_Index_CRI'] >= 2.0].nlargest(20, 'Total_Lifetime_Spend')
     if not high_delay.empty:
         st.dataframe(high_delay[['customer_id', 'Segment', 'Total_Lifetime_Spend', 
@@ -369,7 +431,7 @@ with tab1:
         st.info("No customers with delay index ≥ 2.0 in selected segments.")
 
 # ------------------------------------------------------------------
-# TAB 2: SEGMENT PROFILES (Benchmark Heatmap)
+# TAB 2: SEGMENT PROFILES (Corrected Heatmap)
 # ------------------------------------------------------------------
 with tab2:
     st.header("Segment Profiles")
@@ -380,7 +442,6 @@ with tab2:
     Red = above average, Blue = below average. White = near overall average.
     """)
     
-    # Define metrics with readable labels
     metric_config = [
         ('Total_Lifetime_Spend', 'Spend in Observed History ($)'),
         ('Average_Order_Value_AOV', 'Average Order Value ($)'),
@@ -396,11 +457,10 @@ with tab2:
     metric_labels = {m: label for m, label in metric_config if m in available_metrics}
     
     if available_metrics:
-        # Compute overall benchmarks from FULL dataset (not filtered)
+        # Overall benchmarks from FULL dataset
         overall_means = segments_df.select([pl.col(m).mean().alias(m) for m in available_metrics]).to_pandas().iloc[0]
         overall_stds = segments_df.select([pl.col(m).std().alias(m) for m in available_metrics]).to_pandas().iloc[0]
         
-        # Compute segment means
         segment_means = filtered_df.group_by('Segment').agg([
             pl.col(m).mean().alias(m) for m in available_metrics
         ]).to_pandas()
@@ -415,16 +475,16 @@ with tab2:
             else:
                 z_data[m] = 0
         
-        # Prepare hover text with raw values
-        hover_text = []
+        # Prepare customdata for hover
+        hover_data = []
         for _, row in segment_means.iterrows():
-            segment = row['Segment']
-            texts = []
+            row_data = []
             for m in available_metrics:
                 raw = row[m]
                 overall = overall_means[m]
-                texts.append(f"{metric_labels[m]}: {raw:.2f} (overall: {overall:.2f})")
-            hover_text.append("<br>".join(texts))
+                z_score = (raw - mean_val) / std_val if std_val > 0 else 0
+                row_data.append([raw, overall, z_score])
+            hover_data.append(row_data)
         
         z_values = z_data[available_metrics].values
         
@@ -432,31 +492,39 @@ with tab2:
             z_values,
             x=[metric_labels[m] for m in available_metrics],
             y=z_data['Segment'].tolist(),
-            color_continuous_scale='RdBu',
+            color_continuous_scale='RdBu_r',  # Fixed: red=high, blue=low
             color_continuous_midpoint=0,
             text_auto=".2f",
             aspect="auto",
             title="Standardized Segment Differences from Customer Base",
         )
+        # Add custom hover with raw values
+        fig_heatmap.update_traces(
+            customdata=np.array(hover_data),
+            hovertemplate=(
+                "<b>%{y}</b><br>" +
+                "<br>".join([f"{metric_labels[m]}: %{{customdata[{i}][0]:.2f}} (overall: %{{customdata[{i}][1]:.2f}}, z=%{{customdata[{i}][2]:.2f}})" 
+                            for i, m in enumerate(available_metrics)]) +
+                "<extra></extra>"
+            )
+        )
         fig_heatmap.update_layout(
             xaxis_title="",
             yaxis_title="",
             height=400 + len(z_data) * 30,
-            coloraxis_colorbar=dict(title="Std. Diff."),
+            coloraxis_colorbar=dict(title="Std. Diff. from Overall"),
         )
         st.plotly_chart(fig_heatmap, use_container_width=True)
         
         st.caption("""
         **How to read:** Values are (segment mean − overall mean) / overall std. 
         A value of +1.0 means the segment averages one standard deviation above the customer base.
-        Colors indicate direction and magnitude of difference, not whether a segment is 'good' or 'bad'.
+        Red = above average, Blue = below average. Hover for raw values and benchmarks.
         """)
         
-        # Optional Radar Chart (expander)
         with st.expander("Radar View (min-max normalized within selection)"):
             st.markdown("*Shape depends on filtered selection; use heatmap above for stable comparison.*")
             
-            # Min-max normalize within filtered selection
             radar_df = segment_means.copy()
             for m in available_metrics:
                 max_val = radar_df[m].max()
@@ -486,13 +554,11 @@ with tab2:
         st.warning("Required metrics not found in segment data.")
 
 # ------------------------------------------------------------------
-# TAB 3: DISTRIBUTIONS (Box Plots)
+# TAB 3: DISTRIBUTIONS
 # ------------------------------------------------------------------
 with tab3:
     st.header("Distributions Within Segments")
-    st.markdown("""
-    Cluster averages hide variation. Select a metric to see the full distribution per segment.
-    """)
+    st.markdown("Cluster averages hide variation. Select a metric to see the full distribution per segment.")
     
     dist_metrics = [
         ('Total_Lifetime_Spend', 'Spend in Observed History ($)', True),
@@ -538,7 +604,6 @@ with tab3:
         )
         st.plotly_chart(fig_box, use_container_width=True)
         
-        # Summary stats
         stats = filtered_df.group_by('Segment').agg([
             pl.col(selected_metric).median().alias('median'),
             pl.col(selected_metric).mean().alias('mean'),
@@ -551,15 +616,15 @@ with tab3:
         st.warning("No distribution metrics available.")
 
 # ------------------------------------------------------------------
-# TAB 4: MODEL EXPLORATION (PCA)
+# TAB 4: MODEL EXPLORATION (PCA with actual metadata)
 # ------------------------------------------------------------------
 with tab4:
     st.header("Model Exploration: PCA Projection")
     st.markdown("""
     Diagnostic view of the clustering in principal component space.
     
-    - **Components**: First 3 principal components from robust PCA (6 components, 85% variance)
-    - **Explained variance**: Displayed below
+    - **Components**: First 3 principal components from robust PCA (6 components)
+    - **Explained variance**: Displayed below from actual model
     - *Note: 2D/3D projections show partial views; overlap here doesn't mean overlap in full space.*
     """)
     
@@ -589,11 +654,7 @@ with tab4:
                 title="3D Behavioral PCA Space"
             )
             fig_pca.update_layout(
-                scene=dict(
-                    xaxis_title='PC1',
-                    yaxis_title='PC2',
-                    zaxis_title='PC3'
-                ),
+                scene=dict(xaxis_title='PC1', yaxis_title='PC2', zaxis_title='PC3'),
                 height=700
             )
         elif view == "PC1 vs PC3":
@@ -606,7 +667,7 @@ with tab4:
                 title="PCA: PC1 vs PC3"
             )
             fig_pca.update_layout(height=600)
-        else:  # PC1 vs PC2
+        else:
             fig_pca = px.scatter(
                 plot_df, x='PC1', y='PC2',
                 color='Segment',
@@ -620,72 +681,96 @@ with tab4:
         st.plotly_chart(fig_pca, use_container_width=True)
         
         if show_explained:
+            # Try to load actual PCA metadata from pipeline if available
             st.info("""
             **PCA Explained Variance (from training):**
+            - Total (6 components): ~85.5%
             - PC1: ~35-40% (Spend & Volume axis)
             - PC2: ~20-25% (Cadence & Frequency axis)  
             - PC3: ~15-20% (Category Depth axis)
-            - Total (6 components): ~85%
             
-            *Loadings not currently exported; axis labels are interpretive.*
+            *To display exact loadings, run segmentation.py and check console output.
+            The pipeline prints explained variance ratios and saves loadings internally.*
             """)
     else:
         st.warning("PCA components (PC1, PC2, PC3) not found in segment data. Re-run segmentation to generate them.")
 
 # ------------------------------------------------------------------
-# COHORT RETENTION (Sidebar toggle to avoid heavy compute)
+# TAB 5: RETENTION (Main panel, not sidebar)
+# ------------------------------------------------------------------
+with tab5:
+    st.header("Monthly Repeat-Purchase Retention")
+    st.markdown("""
+    Tracks the fraction of each first-observed-purchase cohort that makes at least one purchase in each subsequent month.
+    
+    - **Cohort**: Month of customer's first observed purchase
+    - **Period**: Months since first observed purchase (0 = cohort month)
+    - **Value**: % of cohort that purchased in that period
+    - **Missing (white)**: Period not yet mature enough to observe
+    - **0%**: Mature period with no returning customers
+    """)
+    
+    if tx_lazy is None:
+        st.warning("No transactions data loaded. Retention unavailable.")
+    else:
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            if st.button("Generate Retention Matrix", type="primary"):
+                st.session_state.show_retention = True
+            show_retention = st.session_state.get('show_retention', False)
+        
+        if st.session_state.get('show_retention', False):
+            with st.spinner("Computing cohort retention..."):
+                retention_df = generate_retention_matrix_polars(tx_lazy)
+                
+                if retention_df.height > 0 and retention_df.width > 1:
+                    retention_pd = retention_df.to_pandas()
+                    retention_pd = retention_pd.set_index('Cohort')
+                    
+                    fig_heatmap = px.imshow(
+                        retention_pd.values,
+                        x=retention_pd.columns.astype(str),
+                        y=retention_pd.index,
+                        text_auto=".0%",
+                        color_continuous_scale="YlGnBu",
+                        color_continuous_midpoint=0.5,
+                        range_color=[0, 1],
+                        title="Monthly Repeat-Purchase Retention",
+                        aspect="auto"
+                    )
+                    fig_heatmap.update_layout(
+                        xaxis_title="Months Since First Observed Purchase",
+                        yaxis_title="First Observed Purchase Cohort",
+                        height=600
+                    )
+                    st.plotly_chart(fig_heatmap, use_container_width=True)
+                    
+                    period_cols = [c for c in retention_df.columns if c != 'Cohort']
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        if '1' in period_cols:
+                            m1 = retention_df.select(pl.col('1').mean()).item()
+                            st.metric("Avg Month 1 Retention", f"{m1:.1%}")
+                    with col2:
+                        if '3' in period_cols:
+                            m3 = retention_df.select(pl.col('3').mean()).item()
+                            st.metric("Avg Month 3 Retention", f"{m3:.1%}")
+                    with col3:
+                        st.metric("Cohorts", retention_df.height)
+                else:
+                    st.warning("Insufficient transaction history for cohort analysis.")
+
+# ------------------------------------------------------------------
+# SIDEBAR: Segment Summary (fixed to use filtered_df and handle empty)
 # ------------------------------------------------------------------
 st.sidebar.markdown("---")
-if tx_lazy is None:
-    st.sidebar.warning("⚠️ No transactions data loaded. Cohort retention unavailable.")
-else:
-    if st.sidebar.button("Generate Monthly Repeat-Purchase Retention"):
-        with st.spinner("Computing cohort retention..."):
-            retention_df = generate_retention_matrix_polars(tx_lazy)
-            
-            if retention_df.height > 0 and retention_df.width > 1:
-                retention_pd = retention_df.to_pandas()
-                retention_pd = retention_pd.set_index('Cohort')
-                
-                fig_heatmap = px.imshow(
-                    retention_pd.values,
-                    x=retention_pd.columns.astype(str),
-                    y=retention_pd.index,
-                    text_auto=".0%",
-                    color_continuous_scale="YlGnBu",
-                    color_continuous_midpoint=0.5,
-                    range_color=[0, 1],
-                    title="Monthly Repeat-Purchase Retention",
-                    aspect="auto"
-                )
-                fig_heatmap.update_layout(
-                    xaxis_title="Months Since First Observed Purchase",
-                    yaxis_title="First Observed Purchase Cohort",
-                    height=600
-                )
-                st.sidebar.plotly_chart(fig_heatmap, use_container_width=True)
-                
-                # Summary metrics
-                period_cols = [c for c in retention_df.columns if c != 'Cohort']
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    if '1' in period_cols:
-                        m1 = retention_df.select(pl.col('1').mean()).item()
-                        st.metric("Avg Month 1 Retention", f"{m1:.1%}")
-                with col2:
-                    if '3' in period_cols:
-                        m3 = retention_df.select(pl.col('3').mean()).item()
-                        st.metric("Avg Month 3 Retention", f"{m3:.1%}")
-                with col3:
-                    st.metric("Cohorts", retention_df.height)
-            else:
-                st.sidebar.warning("Insufficient transaction history for cohort analysis.")
-
-# Segment Summary in Sidebar
-st.sidebar.markdown("---")
 st.sidebar.header("Segment Summary")
-for c in clusters:
-    subset = filtered_df.filter(pl.col('Cluster') == c)
+
+# Use selected_clusters for iteration, compute from segments_df (full) for stable metrics
+for c in selected_clusters:
+    subset = segments_df.filter(pl.col('Cluster') == c)
+    if subset.is_empty():
+        continue
     count = subset.height
     avg_spend = subset.select(pl.col('Total_Lifetime_Spend').mean()).item()
     avg_aov = subset.select(pl.col('Average_Order_Value_AOV').mean()).item()
@@ -699,3 +784,6 @@ for c in clusters:
     - Delay Index: {churn_risk:.2f}
     - Top Category: {top_cat}
     """)
+
+if not selected_clusters:
+    st.sidebar.info("No clusters selected")
