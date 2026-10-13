@@ -1,6 +1,6 @@
 import polars as pl
 import numpy as np
-import pandas as pd
+from datetime import timedelta
 from sklearn.preprocessing import RobustScaler
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
@@ -19,6 +19,7 @@ class AdvancedCustomerSegmentation:
         self.pca = PCA(n_components=self.n_components, random_state=self.random_state)
         self.optimal_k = None
         self.model = None
+        self._feature_names = None
 
     def validate_and_clean(self, lazy_df: pl.LazyFrame) -> pl.LazyFrame:
         """Enforces schema constraints using Polars expressions."""
@@ -54,7 +55,7 @@ class AdvancedCustomerSegmentation:
     def generate_advanced_metrics(self, lazy_transactions: pl.LazyFrame) -> pl.DataFrame:
         """
         Engineers 50+ advanced retail metrics strictly from the transaction schema.
-        (Integrated directly from your generate_metrics.py script)
+        All operations stay in Polars for maximum performance.
         """
         df = lazy_transactions.with_columns([
             (pl.col('quantity') * pl.col('price')).alias('line_total'),
@@ -64,7 +65,8 @@ class AdvancedCustomerSegmentation:
         ])
 
         max_date = df.select(pl.col('tx_date').max()).collect().item()
-        ref_date = max_date + pd.Timedelta(days=1)
+        ref_date = max_date + timedelta(days=1)
+        ref_date_expr = pl.lit(ref_date)
         total_depts = df.select(pl.col('department').n_unique()).collect().item()
 
         cat_benchmarks = df.group_by('category').agg([
@@ -118,7 +120,7 @@ class AdvancedCustomerSegmentation:
             pl.col('is_premium_purchase').sum().alias('premium_item_count'),
             pl.col('is_bargain_purchase').sum().alias('bargain_item_count'),
             pl.col('is_discounted_sku').sum().alias('discounted_item_count'),
-            (pl.lit(ref_date) - pl.col('tx_date').max()).dt.total_days().alias('Recency_Days'),
+            (ref_date_expr - pl.col('tx_date').max()).dt.total_days().alias('Recency_Days'),
             (pl.col('tx_date').max() - pl.col('tx_date').min()).dt.total_days().alias('Tenure_Days'),
             pl.col('tx_date').n_unique().alias('Active_Days'),
             (pl.col('weekday') >= 6).sum().alias('weekend_item_count'),
@@ -154,61 +156,90 @@ class AdvancedCustomerSegmentation:
         
         return final_metrics.drop(cols_to_drop)
 
-    def _preprocess_data(self, features_df: pd.DataFrame) -> np.ndarray:
+    def _preprocess_data(self, features_df: pl.DataFrame) -> tuple[np.ndarray, list]:
         """
-        Robust preprocessing pipeline:
+        Robust preprocessing pipeline - ALL IN POLARS:
         1. Winsorization at 99th percentile to cap extreme outliers
-        2. RobustScaler (median/IQR) immune to outlier pull
-        3. PCA dimensionality reduction
+        2. Log1p transform for skewed financial metrics
+        3. RobustScaler equivalent (median/IQR) via Polars expressions
+        4. Convert to numpy only for sklearn PCA
         """
-        numeric_cols = features_df.drop('customer_id', axis=1).columns
-        data = features_df[numeric_cols].copy()
+        # Drop customer_id for processing, keep track of feature names
+        self._feature_names = [c for c in features_df.columns if c != 'customer_id']
+        data = features_df.select(self._feature_names)
         
         # 1. Handle NaNs and Infinity resulting from division by zero
-        data.replace([np.inf, -np.inf], np.nan, inplace=True)
-        data.fillna(0, inplace=True)
+        data = data.fill_nan(0).fill_null(0)
         
-        # 2. Winsorize extreme outliers at the 99th percentile
-        # This caps the heavy tails that dominate variance in retail data
-        for col in data.columns:
-            p99 = data[col].quantile(0.99)
-            data[col] = np.clip(data[col], a_min=None, a_max=p99)
+        # 2. Winsorize extreme outliers at the 99th percentile using Polars
+        # Compute all 99th percentiles in one pass
+        p99_exprs = [pl.col(c).quantile(0.99).alias(f"{c}_p99") for c in self._feature_names]
+        p99_values = data.select(p99_exprs).row(0)
+        p99_dict = dict(zip([f"{c}_p99" for c in self._feature_names], p99_values))
+        
+        # Apply clipping
+        clip_exprs = []
+        for c in self._feature_names:
+            p99 = p99_dict[f"{c}_p99"]
+            clip_exprs.append(pl.col(c).clip(upper_bound=p99).alias(c))
+        data = data.with_columns(clip_exprs)
             
         # 3. Log transform highly skewed financial metrics (after winsorization)
         skewed_cols = ['Total_Lifetime_Spend', 'Total_Lifetime_Units', 'Max_Basket_Value', 'Average_Order_Value_AOV']
+        log_exprs = []
         for col in skewed_cols:
-            if col in data.columns:
-                data[col] = np.log1p(np.maximum(data[col], 0))
-                 
-        # 4. Standardize Data using RobustScaler (median/IQR)
-        # Unlike StandardScaler, RobustScaler ignores the pull of massive outliers
-        scaled_array = self.scaler.fit_transform(data)
+            if col in self._feature_names:
+                log_exprs.append(pl.col(col).log1p().alias(col))
+            else:
+                log_exprs.append(pl.col(col))
+        if log_exprs:
+            data = data.with_columns(log_exprs)
         
-        # 5. Dimensionality Reduction (PCA)
-        print(f"   -> Reducing {len(numeric_cols)} features to {self.n_components} principal components...")
-        pca_result = self.pca.fit_transform(scaled_array)
+        # 4. RobustScaler equivalent in Polars: (x - median) / IQR
+        # Compute median and IQR for each column
+        median_exprs = [pl.col(c).median().alias(f"{c}_median") for c in self._feature_names]
+        q25_exprs = [pl.col(c).quantile(0.25).alias(f"{c}_q25") for c in self._feature_names]
+        q75_exprs = [pl.col(c).quantile(0.75).alias(f"{c}_q75") for c in self._feature_names]
+        
+        stats = data.select(median_exprs + q25_exprs + q75_exprs).row(0)
+        n = len(self._feature_names)
+        medians = stats[:n]
+        q25s = stats[n:2*n]
+        q75s = stats[2*n:]
+        
+        # Apply robust scaling
+        scale_exprs = []
+        for i, c in enumerate(self._feature_names):
+            median = medians[i]
+            iqr = q75s[i] - q25s[i]
+            if iqr > 0:
+                scale_exprs.append(((pl.col(c) - median) / iqr).alias(c))
+            else:
+                scale_exprs.append(pl.lit(0.0).alias(c))
+        data = data.with_columns(scale_exprs)
+        
+        # 5. Convert to numpy for sklearn PCA (only at this point)
+        pca_input = data.to_numpy()
+        
+        print(f"   -> Reducing {len(self._feature_names)} features to {self.n_components} principal components...")
+        pca_result = self.pca.fit_transform(pca_input)
         
         variance_explained = sum(self.pca.explained_variance_ratio_) * 100
         print(f"   -> PCA retains {variance_explained:.2f}% of the original behavioral variance.")
         
-        return pca_result
+        return pca_result, self._feature_names
 
     def _find_optimal_k(self, pca_data: np.ndarray) -> int:
         """
         Optimize cluster count using Davies-Bouldin Index.
-        
-        Davies-Bouldin is preferred over Silhouette for dense retail distributions
-        because it measures intra-cluster similarity vs inter-cluster separation
-        without penalizing compact clusters. Lower score = better separation.
+        Lower score = better separation.
         """
-        best_k = 3  # Force minimum 3 clusters for actionable CRM segmentation
-        best_score = float('inf')  # Lower is better for Davies-Bouldin
+        best_k = 3
+        best_score = float('inf')
         
         for k in range(3, self.max_clusters + 1):
             kmeans = KMeans(n_clusters=k, random_state=self.random_state, n_init=10)
             labels = kmeans.fit_predict(pca_data)
-            
-            # Davies-Bouldin Index: ratio of within-cluster scatter to between-cluster separation
             score = davies_bouldin_score(pca_data, labels) 
             
             if score < best_score:
@@ -218,7 +249,7 @@ class AdvancedCustomerSegmentation:
         print(f"   -> Davies-Bouldin optimization selected k={best_k} (score={best_score:.4f})")
         return best_k
 
-    def fit_predict(self, data_source) -> pd.DataFrame:
+    def fit_predict(self, data_source) -> pl.DataFrame:
         if isinstance(data_source, str):
             print(f"0. Scanning lazy data from {data_source}...")
             lazy_df = pl.scan_parquet(data_source)
@@ -237,8 +268,7 @@ class AdvancedCustomerSegmentation:
         print(f"   -> Generated 50+ features for {len(polars_features)} unique customers.")
         
         print("3. Preprocessing Data (Winsorization, RobustScaling & PCA)...")
-        pandas_features = polars_features.to_pandas()
-        pca_data = self._preprocess_data(pandas_features)
+        pca_data, feature_names = self._preprocess_data(polars_features)
         
         print("4. Optimizing Cluster Count on Principal Components...")
         self.optimal_k = self._find_optimal_k(pca_data)
@@ -246,15 +276,19 @@ class AdvancedCustomerSegmentation:
         
         print("5. Fitting Final Model...")
         self.model = KMeans(n_clusters=self.optimal_k, random_state=self.random_state, n_init=10)
+        cluster_labels = self.model.fit_predict(pca_data)
         
-        pandas_features['Cluster'] = self.model.fit_predict(pca_data)
+        # 6. Add results back to Polars DataFrame (stay in Polars!)
+        result = polars_features.with_columns([
+            pl.Series(name="Cluster", values=cluster_labels, dtype=pl.Int32),
+        ])
         
-        # 6. Add PCA components to output for 3D visualization
+        # Add PCA components
         pca_cols = [f'PC{i+1}' for i in range(self.n_components)]
-        pca_df = pd.DataFrame(pca_data, columns=pca_cols, index=pandas_features.index)
-        pandas_features = pd.concat([pandas_features, pca_df], axis=1)
+        for i, pc_name in enumerate(pca_cols):
+            result = result.with_columns(pl.Series(name=pc_name, values=pca_data[:, i], dtype=pl.Float64))
         
-        return pandas_features
+        return result
 
 
 # ==========================================
@@ -263,12 +297,9 @@ class AdvancedCustomerSegmentation:
 if __name__ == "__main__":
     data_path = "customer_transactions_clean.parquet"
     
-    # Initialize pipeline with 6 PCA components
     pipeline = AdvancedCustomerSegmentation(max_clusters=8, n_components=6)
+    segmented_customers = pipeline.fit_predict(data_path)
     
-    # Run the full unified process
-    segmented_customers_pd = pipeline.fit_predict(data_path)
-    
-    # Save the richly featured segments with PCA components
-    segmented_customers_pd.to_parquet("customer_segments_advanced.parquet")
+    # Save directly from Polars
+    segmented_customers.write_parquet("customer_segments_advanced.parquet")
     print("\nSaved segments to customer_segments_advanced.parquet")
