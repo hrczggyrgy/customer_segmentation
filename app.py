@@ -14,8 +14,20 @@ def load_data():
     # Polars reads the parquet file instantly
     return pl.read_parquet("customer_segments_advanced.parquet").to_pandas()
 
+@st.cache_data
+def load_transactions():
+    return pl.read_parquet("customer_transactions_clean.parquet").to_pandas()
+
 df = load_data()
 clusters = sorted(df['Cluster'].unique())
+
+# Add Primary_Category_Name if missing (derive from transactions)
+if 'Primary_Category_Name' not in df.columns:
+    tx = load_transactions()
+    primary_cat = tx.groupby('customer_id')['category'].agg(lambda x: x.mode().iloc[0] if not x.mode().empty else 'Unknown').reset_index()
+    primary_cat.columns = ['customer_id', 'Primary_Category_Name']
+    df = df.merge(primary_cat, on='customer_id', how='left')
+    df['Primary_Category_Name'] = df['Primary_Category_Name'].fillna('Unknown')
 
 # 3. Sidebar Filters
 st.sidebar.header("Global Filters")
