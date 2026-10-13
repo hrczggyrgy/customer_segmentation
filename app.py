@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 import numpy as np
 import io
 import hashlib
+import json
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -24,19 +25,38 @@ if 'segments_generated' not in st.session_state:
     st.session_state.segments_generated = False
 if 'tx_fingerprint' not in st.session_state:
     st.session_state.tx_fingerprint = None
+if 'segments_fingerprint' not in st.session_state:
+    st.session_state.segments_fingerprint = None
 
 # ============================================================
 # HELPER FUNCTIONS
 # ============================================================
 def compute_fingerprint(df: pl.DataFrame) -> str:
-    """Compute a stable fingerprint of the DataFrame for change detection."""
-    # Use schema + row count + a sample of data for quick fingerprinting
-    n_rows = df.height
-    schema_str = str(df.schema)
-    # Sample first 100 rows for content hash
-    sample = df.head(100).to_numpy().tobytes()
+    """Compute a stable fingerprint of the DataFrame for change detection.
+    Uses a hash of the underlying file for deterministic fingerprinting."""
+    # For Parquet files, we can't easily get the file path from a DataFrame
+    # Fall back to hashing a stable sample
+    # Sort by all columns for deterministic ordering
+    df_sorted = df.sort(df.columns)
+    n_rows = df_sorted.height
+    schema_str = str(df_sorted.schema)
+    sample = df_sorted.head(min(1000, n_rows)).to_numpy().tobytes()
     content = f"{n_rows}:{schema_str}:{hashlib.md5(sample).hexdigest()}"
     return hashlib.md5(content.encode()).hexdigest()[:16]
+
+def compute_file_fingerprint(uploaded_file) -> str:
+    """Compute fingerprint of uploaded file bytes."""
+    uploaded_file.seek(0)
+    content = uploaded_file.read()
+    uploaded_file.seek(0)
+    return hashlib.sha256(content).hexdigest()[:16]
+
+def compute_local_file_fingerprint(path: str) -> str:
+    """Compute fingerprint of local Parquet file."""
+    import hashlib
+    with open(path, 'rb') as f:
+        content = f.read()
+    return hashlib.sha256(content).hexdigest()[:16]
 
 # ============================================================
 # FILE UPLOAD
@@ -66,26 +86,41 @@ def load_transactions_from_file(uploaded_file) -> pl.DataFrame:
         return None
 
 # ============================================================
-# SEGMENTATION PIPELINE (cached)
+# SEGMENTATION PIPELINE (cached) - returns (segments_df, metadata_dict)
 # ============================================================
 @st.cache_data(show_spinner=False)
-def run_segmentation_pipeline(transactions_df: pl.DataFrame) -> pl.DataFrame:
-    """Run the full segmentation pipeline on transaction data."""
+def run_segmentation_pipeline(transactions_df: pl.DataFrame, tx_fingerprint: str):
+    """Run the full segmentation pipeline on transaction data.
+    Returns (segments_df, metadata_dict)."""
     pipeline = AdvancedCustomerSegmentation(max_clusters=8, n_components=6)
     segments = pipeline.fit_predict(transactions_df)
-    return segments
+    metadata = pipeline.get_pca_metadata(tx_fingerprint)
+    return segments, metadata
 
-def get_or_generate_segments(tx_df: pl.DataFrame) -> pl.DataFrame:
-    """Load existing segments or generate new ones from transactions."""
-    # Try to load local segments file first
-    try:
-        segments = pl.read_parquet("customer_segments_advanced.parquet")
-        st.sidebar.success("✅ Loaded existing segments from local file")
-        return segments
-    except FileNotFoundError:
-        pass
+def get_or_generate_segments(tx_df: pl.DataFrame, tx_fingerprint: str, force_refresh: bool = False):
+    """Load existing segments or generate new ones from transactions.
+    Segments are matched to source data via fingerprint.
+    force_refresh=True bypasses cached artifact."""
     
-    # If no local file, run pipeline on provided transactions
+    # Check if we have a matching local segment artifact
+    if not force_refresh:
+        try:
+            segments = pl.read_parquet("customer_segments_advanced.parquet")
+            # Check if fingerprint matches
+            try:
+                with open("pca_metadata.json", 'r') as f:
+                    metadata = json.load(f)
+                if metadata.get('source_fingerprint') == tx_fingerprint:
+                    st.sidebar.success("✅ Loaded matching segments from local file")
+                    return segments, metadata
+                else:
+                    st.sidebar.warning("⚠️ Local segments don't match current data. Regenerating...")
+            except (FileNotFoundError, json.JSONDecodeError):
+                st.sidebar.warning("⚠️ No metadata for local segments. Regenerating...")
+        except FileNotFoundError:
+            pass
+    
+    # If no matching local file, or force_refresh, run pipeline on provided transactions
     if tx_df is not None:
         status_placeholder = st.sidebar.empty()
         try:
@@ -96,13 +131,15 @@ def get_or_generate_segments(tx_df: pl.DataFrame) -> pl.DataFrame:
                 status.write("Step 4/5: Optimizing cluster count (Davies-Bouldin)...")
                 status.write("Step 5/5: Fitting final KMeans model...")
                 
-                segments = run_segmentation_pipeline(tx_df)
+                segments, metadata = run_segmentation_pipeline(tx_df, tx_fingerprint)
                 
                 # Save to local file for future runs
                 segments.write_parquet("customer_segments_advanced.parquet")
+                with open("pca_metadata.json", 'w') as f:
+                    json.dump(metadata, f, indent=2)
                 status.update(label="✅ Segments generated and saved!", state="complete")
             
-            return segments
+            return segments, metadata
         except Exception as e:
             st.sidebar.error(f"❌ Segmentation failed: {str(e)}")
             st.error(f"Segmentation error: {e}")
@@ -112,11 +149,12 @@ def get_or_generate_segments(tx_df: pl.DataFrame) -> pl.DataFrame:
     st.stop()
 
 # ============================================================
-# RETENTION MATRIX (cached)
+# RETENTION MATRIX (cached) - Fixed: Proper cohort maturity handling
 # ============================================================
 @st.cache_data
 def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFrame:
-    """Generates a Monthly Repeat-Purchase Retention matrix entirely in Polars."""
+    """Generates a Monthly Repeat-Purchase Retention matrix entirely in Polars.
+    Properly handles cohort maturity: immature periods = null, mature zero = 0%."""
     df = transactions_lf.with_columns([
         pl.col('transaction_date').dt.truncate('1mo').alias('OrderMonth'),
     ]).with_columns([
@@ -145,8 +183,7 @@ def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFr
         aggregate_function='first'
     ).sort('CohortMonth')
     
-    # DO NOT fill_null globally - preserves NaN for immature periods
-    # Only normalize periods that have data
+    # DO NOT fill_null globally - preserves null for unobserved periods
     period_cols = [c for c in cohort_pivot.columns if c != 'CohortMonth' and isinstance(c, (int, str))]
     period_cols_int = []
     for c in period_cols:
@@ -157,15 +194,29 @@ def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFr
     
     if period_cols_int:
         period_cols_int.sort()
+        
+        # Calculate dataset's final observed month for maturity
+        max_order_month = df.select(pl.col('OrderMonth').max()).collect().item()
+        
         if 0 in period_cols_int:
             cohort_sizes = cohort_pivot.select(pl.col("0")).to_series()
             for pc in period_cols_int:
                 pc_str = str(pc)
                 if pc != 0:
-                    # Only divide where Month 0 size > 0 and period has data
+                    # Determine if period is mature for each cohort
+                    # A period is mature if CohortMonth + pc <= max_order_month
+                    # For each cohort row, check maturity
                     cohort_pivot = cohort_pivot.with_columns(
-                        pl.when(pl.col(pc_str).is_not_null() & (pl.col("0") > 0))
-                        .then(pl.col(pc_str) / pl.col("0"))
+                        pl.when(
+                            (pl.col("0") > 0) & 
+                            ((pl.col('CohortMonth').dt.year() * 12 + pl.col('CohortMonth').dt.month() + pc) <= 
+                             (max_order_month.year() * 12 + max_order_month.month()))
+                        )
+                        .then(
+                            pl.when(pl.col(pc_str).is_not_null())
+                            .then(pl.col(pc_str) / pl.col("0"))
+                            .otherwise(pl.lit(0.0))
+                        )
                         .otherwise(None)
                         .alias(pc_str)
                     )
@@ -178,6 +229,7 @@ def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFr
         pl.col('CohortMonth').dt.strftime('%Y-%m').alias('Cohort')
     ).drop('CohortMonth')
     
+    # Ensure period columns are sorted numerically
     new_cols = ['Cohort'] + [str(pc) for pc in period_cols_int]
     return cohort_pivot.select(new_cols)
 
@@ -188,8 +240,7 @@ def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFr
 # Load transactions (handle upload changes correctly)
 if uploaded_transactions is not None:
     # New upload - compute fingerprint to detect actual changes
-    new_fp = compute_fingerprint(pl.read_parquet(io.BytesIO(uploaded_transactions.read())))
-    uploaded_transactions.seek(0)  # Reset for next read
+    new_fp = compute_file_fingerprint(uploaded_transactions)
     
     if st.session_state.tx_fingerprint != new_fp:
         # Data actually changed - load new data and reset segments
@@ -198,6 +249,7 @@ if uploaded_transactions is not None:
         st.session_state.tx_fingerprint = new_fp
         st.session_state.segments_generated = False
         st.session_state.segments_df = None
+        st.session_state.segments_fingerprint = None
         st.sidebar.info("🔄 New transaction data detected. Please regenerate segments.")
     else:
         # Same data - use cached
@@ -211,7 +263,7 @@ else:
             tx_df = pl.read_parquet("customer_transactions_clean.parquet")
             st.session_state.tx_df = tx_df
             if st.session_state.tx_fingerprint is None:
-                st.session_state.tx_fingerprint = compute_fingerprint(tx_df)
+                st.session_state.tx_fingerprint = compute_local_file_fingerprint("customer_transactions_clean.parquet")
         except FileNotFoundError:
             st.error("No transaction data available. Please upload a parquet file.")
             st.stop()
@@ -223,17 +275,33 @@ tx_lazy = tx_df.lazy()
 # ============================================================
 if not st.session_state.segments_generated or st.session_state.segments_df is None:
     # Show generate button
-    if st.sidebar.button("🔄 Generate / Refresh Segments", type="primary", use_container_width=True):
-        with st.spinner("Running segmentation..."):
-            segments_df = get_or_generate_segments(tx_df)
-            st.session_state.segments_df = segments_df
-            st.session_state.segments_generated = True
-        st.rerun()
-    else:
-        st.info("👈 Click **'Generate / Refresh Segments'** in the sidebar to run the segmentation pipeline.")
-        st.stop()
+    col1, col2 = st.sidebar.columns([3, 1])
+    with col1:
+        if st.button("🔄 Generate / Refresh Segments", type="primary", use_container_width=True):
+            with st.spinner("Running segmentation..."):
+                segments_df, metadata = get_or_generate_segments(tx_df, st.session_state.tx_fingerprint, force_refresh=True)
+                st.session_state.segments_df = segments_df
+                st.session_state.segments_fingerprint = st.session_state.tx_fingerprint
+                st.session_state.segments_generated = True
+            st.rerun()
+    with col2:
+        if st.button("⚡ Force", help="Force regenerate even if segments exist"):
+            with st.spinner("Force regenerating..."):
+                segments_df, metadata = get_or_generate_segments(tx_df, st.session_state.tx_fingerprint, force_refresh=True)
+                st.session_state.segments_df = segments_df
+                st.session_state.segments_fingerprint = st.session_state.tx_fingerprint
+                st.session_state.segments_generated = True
+            st.rerun()
+    st.info("👈 Click **'Generate / Refresh Segments'** in the sidebar to run the segmentation pipeline.")
+    st.stop()
 else:
     segments_df = st.session_state.segments_df
+
+# Verify segments match current data
+if st.session_state.segments_fingerprint != st.session_state.tx_fingerprint:
+    st.sidebar.error("⚠️ Segments don't match current transaction data! Please refresh.")
+    st.session_state.segments_generated = False
+    st.rerun()
 
 # ============================================================
 # POST-PROCESSING: Add Primary Category
@@ -334,7 +402,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 ])
 
 # ------------------------------------------------------------------
-# TAB 1: RISK–VALUE PORTFOLIO
+# TAB 1: RISK–VALUE PORTFOLIO (Fixed: aligned spend threshold)
 # ------------------------------------------------------------------
 with tab1:
     st.header("Risk–Value Portfolio")
@@ -349,15 +417,19 @@ with tab1:
     *Customers with insufficient repeat-purchase history (index = 0) are shown separately.*
     """)
     
-    plot_df = filtered_df.select([
+    # Use full dataset for threshold calculation (not filtered)
+    full_plot_df = segments_df.select([
         'customer_id', 'Cluster', 'Segment', 'Total_Lifetime_Spend', 
         'Churn_Risk_Index_CRI', 'Recency_Days', 
         'Average_InterPurchase_Time_AIPT', 'Average_Order_Value_AOV'
     ]).to_pandas()
     
-    has_history = plot_df['Average_InterPurchase_Time_AIPT'] > 0
-    no_history = plot_df[~has_history]
-    plot_df = plot_df[has_history]
+    has_history = full_plot_df['Average_InterPurchase_Time_AIPT'] > 0
+    no_history = full_plot_df[~has_history]
+    full_plot_df = full_plot_df[has_history]
+    
+    # Apply cluster filter for plotting
+    plot_df = full_plot_df[full_plot_df['Cluster'].isin(selected_clusters)]
     
     col1, col2 = st.columns([3, 1])
     with col2:
@@ -386,20 +458,26 @@ with tab1:
     fig_scatter.add_vline(x=3.0, line_dash="dash", line_color="red", 
                           annotation_text="Critical Delay", annotation_position="top right")
     
-    # Horizontal spend threshold (percentile-based)
-    spend_threshold = plot_df['Total_Lifetime_Spend'].quantile(spend_pct / 100)
+    # Horizontal spend threshold (percentile-based) - calculated on FULL dataset
+    spend_threshold = full_plot_df['Total_Lifetime_Spend'].quantile(spend_pct / 100)
     fig_scatter.add_hline(y=spend_threshold, line_dash="dot", line_color="green",
                           annotation_text=f"High Value ({spend_pct}th pctl: ${spend_threshold:,.0f})", 
                           annotation_position="bottom right")
     
-    # Quadrant annotations
-    fig_scatter.add_annotation(x=1.5, y=spend_threshold * 1.2, 
-                              text="⚠️ High Value + Overdue", showarrow=False,
-                              font=dict(size=10, color="red"), bgcolor="rgba(255,255,255,0.8)")
-    fig_scatter.add_annotation(x=0.5, y=spend_threshold * 1.2,
+    # Quadrant annotations - properly aligned with risk zones
+    fig_scatter.add_annotation(x=0.5, y=spend_threshold * 1.2, 
                               text="✅ High Value + On Cadence", showarrow=False,
                               font=dict(size=10, color="green"), bgcolor="rgba(255,255,255,0.8)")
-    fig_scatter.add_annotation(x=1.5, y=spend_threshold * 0.3,
+    fig_scatter.add_annotation(x=1.5, y=spend_threshold * 1.2, 
+                              text="⚠️ High Value + Early Delay", showarrow=False,
+                              font=dict(size=10, color="orange"), bgcolor="rgba(255,255,255,0.8)")
+    fig_scatter.add_annotation(x=2.5, y=spend_threshold * 1.2, 
+                              text="🔴 High Value + Overdue", showarrow=False,
+                              font=dict(size=10, color="red"), bgcolor="rgba(255,255,255,0.8)")
+    fig_scatter.add_annotation(x=0.5, y=spend_threshold * 0.3,
+                              text="Low Value + On Cadence", showarrow=False,
+                              font=dict(size=10, color="gray"), bgcolor="rgba(255,255,255,0.8)")
+    fig_scatter.add_annotation(x=2.5, y=spend_threshold * 0.3,
                               text="Low Value + Overdue", showarrow=False,
                               font=dict(size=10, color="orange"), bgcolor="rgba(255,255,255,0.8)")
     
@@ -423,15 +501,20 @@ with tab1:
     st.plotly_chart(fig_scatter, use_container_width=True)
     
     st.subheader("Top Targets: High Value + High Delay")
-    high_delay = plot_df[plot_df['Churn_Risk_Index_CRI'] >= 2.0].nlargest(20, 'Total_Lifetime_Spend')
+    # Use SAME threshold as chart
+    high_delay = full_plot_df[
+        (full_plot_df['Churn_Risk_Index_CRI'] >= 2.0) & 
+        (full_plot_df['Total_Lifetime_Spend'] >= spend_threshold)
+    ].nlargest(20, 'Total_Lifetime_Spend')
+    
     if not high_delay.empty:
         st.dataframe(high_delay[['customer_id', 'Segment', 'Total_Lifetime_Spend', 
                                   'Churn_Risk_Index_CRI', 'Recency_Days', 'Average_Order_Value_AOV']])
     else:
-        st.info("No customers with delay index ≥ 2.0 in selected segments.")
+        st.info("No customers meeting both high-value and high-delay criteria.")
 
 # ------------------------------------------------------------------
-# TAB 2: SEGMENT PROFILES (Corrected Heatmap)
+# TAB 2: SEGMENT PROFILES (Fixed: Correct hover z-scores)
 # ------------------------------------------------------------------
 with tab2:
     st.header("Segment Profiles")
@@ -475,16 +558,21 @@ with tab2:
             else:
                 z_data[m] = 0
         
-        # Prepare customdata for hover
+        # Prepare customdata for hover - ONE value per cell: [raw_mean, overall_mean, z_score]
         hover_data = []
-        for _, row in segment_means.iterrows():
-            row_data = []
-            for m in available_metrics:
+        for _, row in z_data.iterrows():
+            cell_data = []
+            for i, m in enumerate(available_metrics):
                 raw = row[m]
                 overall = overall_means[m]
-                z_score = (raw - mean_val) / std_val if std_val > 0 else 0
-                row_data.append([raw, overall, z_score])
-            hover_data.append(row_data)
+                std_val = overall_stds[m]
+                z_score = (raw - overall) / std_val if std_val > 0 else 0
+                cell_data.append([raw, overall, z_score])
+            hover_data.append(cell_data)
+        
+        # hover_data is now list of lists: each cell has [raw, overall, z]
+        # Convert to numpy array with shape (n_segments, n_metrics, 3)
+        hover_array = np.array(hover_data)
         
         z_values = z_data[available_metrics].values
         
@@ -492,19 +580,23 @@ with tab2:
             z_values,
             x=[metric_labels[m] for m in available_metrics],
             y=z_data['Segment'].tolist(),
-            color_continuous_scale='RdBu_r',  # Fixed: red=high, blue=low
+            color_continuous_scale='RdBu_r',
             color_continuous_midpoint=0,
             text_auto=".2f",
             aspect="auto",
             title="Standardized Segment Differences from Customer Base",
+            # Set symmetric color range for consistency across selections
+            color_continuous_scale='RdBu_r',
         )
         # Add custom hover with raw values
         fig_heatmap.update_traces(
-            customdata=np.array(hover_data),
+            customdata=hover_array,
             hovertemplate=(
                 "<b>%{y}</b><br>" +
-                "<br>".join([f"{metric_labels[m]}: %{{customdata[{i}][0]:.2f}} (overall: %{{customdata[{i}][1]:.2f}}, z=%{{customdata[{i}][2]:.2f}})" 
-                            for i, m in enumerate(available_metrics)]) +
+                "Metric: %{x}<br>" +
+                "Segment mean: %{customdata[0]:.2f}<br>" +
+                "Overall mean: %{customdata[1]:.2f}<br>" +
+                "Z-score: %{customdata[2]:.2f}" +
                 "<extra></extra>"
             )
         )
@@ -513,6 +605,9 @@ with tab2:
             yaxis_title="",
             height=400 + len(z_data) * 30,
             coloraxis_colorbar=dict(title="Std. Diff. from Overall"),
+            # Ensure symmetric color range
+            coloraxis_cmin=-3,
+            coloraxis_cmax=3,
         )
         st.plotly_chart(fig_heatmap, use_container_width=True)
         
@@ -616,7 +711,7 @@ with tab3:
         st.warning("No distribution metrics available.")
 
 # ------------------------------------------------------------------
-# TAB 4: MODEL EXPLORATION (PCA with actual metadata)
+# TAB 4: MODEL EXPLORATION (Fixed: Actual PCA metadata)
 # ------------------------------------------------------------------
 with tab4:
     st.header("Model Exploration: PCA Projection")
@@ -624,7 +719,7 @@ with tab4:
     Diagnostic view of the clustering in principal component space.
     
     - **Components**: First 3 principal components from robust PCA (6 components)
-    - **Explained variance**: Displayed below from actual model
+    - **Explained variance**: Actual values from pipeline metadata
     - *Note: 2D/3D projections show partial views; overlap here doesn't mean overlap in full space.*
     """)
     
@@ -681,22 +776,63 @@ with tab4:
         st.plotly_chart(fig_pca, use_container_width=True)
         
         if show_explained:
-            # Try to load actual PCA metadata from pipeline if available
-            st.info("""
-            **PCA Explained Variance (from training):**
-            - Total (6 components): ~85.5%
-            - PC1: ~35-40% (Spend & Volume axis)
-            - PC2: ~20-25% (Cadence & Frequency axis)  
-            - PC3: ~15-20% (Category Depth axis)
-            
-            *To display exact loadings, run segmentation.py and check console output.
-            The pipeline prints explained variance ratios and saves loadings internally.*
-            """)
+            # Try to load actual PCA metadata
+            try:
+                with open("pca_metadata.json", 'r') as f:
+                    metadata = json.load(f)
+                
+                evr = metadata.get('explained_variance_ratio', [])
+                evc = metadata.get('explained_variance_cumulative', [])
+                
+                if evr:
+                    # Plot explained variance
+                    fig_ev = go.Figure()
+                    fig_ev.add_trace(go.Bar(
+                        x=[f'PC{i+1}' for i in range(len(evr))],
+                        y=[v * 100 for v in evr],
+                        name='Individual',
+                        marker_color='steelblue',
+                        text=[f'{v*100:.1f}%' for v in evr],
+                        textposition='outside',
+                    ))
+                    fig_ev.add_trace(go.Scatter(
+                        x=[f'PC{i+1}' for i in range(len(evc))],
+                        y=[v * 100 for v in evc],
+                        name='Cumulative',
+                        mode='lines+markers+text',
+                        line=dict(color='red', width=3),
+                        text=[f'{v*100:.1f}%' for v in evc],
+                        textposition='top center',
+                        yaxis='y2'
+                    ))
+                    fig_ev.update_layout(
+                        title="PCA Explained Variance",
+                        xaxis_title="Principal Component",
+                        yaxis=dict(title="Individual Variance (%)", side='left'),
+                        yaxis2=dict(title="Cumulative Variance (%)", side='right', overlaying='y', range=[0, 100]),
+                        height=400,
+                        legend=dict(x=0.02, y=0.98)
+                    )
+                    st.plotly_chart(fig_ev, use_container_width=True)
+                    
+                    st.caption(f"""
+                    **Total explained variance (6 components): {evc[-1]*100:.1f}%**
+                    - PC1: {evr[0]*100:.1f}% (Spend & Volume)
+                    - PC2: {evr[1]*100:.1f}% (Cadence & Frequency)
+                    - PC3: {evr[2]*100:.1f}% (Category Depth)
+                    - PC4: {evr[3]*100:.1f}% (Basket Variance)
+                    - PC5: {evr[4]*100:.1f}% (Discount Affinity)
+                    - PC6: {evr[5]*100:.1f}% (Price Variability)
+                    """)
+                else:
+                    st.info("PCA metadata not available. Run segmentation to generate.")
+            except (FileNotFoundError, json.JSONDecodeError):
+                st.info("PCA metadata not found. Run segmentation to generate pca_metadata.json.")
     else:
         st.warning("PCA components (PC1, PC2, PC3) not found in segment data. Re-run segmentation to generate them.")
 
 # ------------------------------------------------------------------
-# TAB 5: RETENTION (Main panel, not sidebar)
+# TAB 5: RETENTION (Fixed: Proper cohort maturity)
 # ------------------------------------------------------------------
 with tab5:
     st.header("Monthly Repeat-Purchase Retention")
@@ -715,7 +851,7 @@ with tab5:
     else:
         col1, col2 = st.columns([3, 1])
         with col2:
-            if st.button("Generate Retention Matrix", type="primary"):
+            if st.button("Generate Retention Matrix", type="primary", use_container_width=True):
                 st.session_state.show_retention = True
             show_retention = st.session_state.get('show_retention', False)
         
@@ -749,19 +885,20 @@ with tab5:
                     col1, col2, col3 = st.columns(3)
                     with col1:
                         if '1' in period_cols:
-                            m1 = retention_df.select(pl.col('1').mean()).item()
-                            st.metric("Avg Month 1 Retention", f"{m1:.1%}")
+                            # Only include non-null (mature) values in average
+                            m1 = retention_df.select(pl.col('1').drop_nulls().mean()).item()
+                            st.metric("Avg Month 1 Retention (mature)", f"{m1:.1%}")
                     with col2:
                         if '3' in period_cols:
-                            m3 = retention_df.select(pl.col('3').mean()).item()
-                            st.metric("Avg Month 3 Retention", f"{m3:.1%}")
+                            m3 = retention_df.select(pl.col('3').drop_nulls().mean()).item()
+                            st.metric("Avg Month 3 Retention (mature)", f"{m3:.1%}")
                     with col3:
                         st.metric("Cohorts", retention_df.height)
                 else:
                     st.warning("Insufficient transaction history for cohort analysis.")
 
 # ------------------------------------------------------------------
-# SIDEBAR: Segment Summary (fixed to use filtered_df and handle empty)
+# SIDEBAR: Segment Summary (Fixed: iterate selected_clusters, use full segments_df)
 # ------------------------------------------------------------------
 st.sidebar.markdown("---")
 st.sidebar.header("Segment Summary")

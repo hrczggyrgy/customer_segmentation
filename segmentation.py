@@ -228,7 +228,9 @@ class AdvancedCustomerSegmentation:
         # Save PCA metadata for interpretability
         self._pca_explained_variance = self.pca.explained_variance_ratio_.tolist()
         # Loadings: components_.T * sqrt(explained_variance) gives correlation of original features with PCs
-        self._pca_loadings = self.pca.components_.T.tolist()
+        # This is the proper way to get feature-PC correlations (factor loadings)
+        explained_variance_sqrt = np.sqrt(self.pca.explained_variance_ratio_)
+        self._pca_loadings = (self.pca.components_.T * explained_variance_sqrt).tolist()
         
         return pca_result, self._feature_names
 
@@ -293,11 +295,11 @@ class AdvancedCustomerSegmentation:
         
         return result
 
-    def get_pca_metadata(self) -> dict:
+    def get_pca_metadata(self, fingerprint: str = None) -> dict:
         """Return PCA metadata for interpretability."""
         if self._pca_explained_variance is None:
             return {}
-        return {
+        metadata = {
             'explained_variance_ratio': self._pca_explained_variance,
             'explained_variance_cumulative': np.cumsum(self._pca_explained_variance).tolist(),
             'loadings': self._pca_loadings,
@@ -305,11 +307,14 @@ class AdvancedCustomerSegmentation:
             'n_components': self.n_components,
             'optimal_k': self.optimal_k,
         }
+        if fingerprint:
+            metadata['source_fingerprint'] = fingerprint
+        return metadata
 
-    def save_metadata(self, path: str = "pca_metadata.json"):
+    def save_metadata(self, path: str = "pca_metadata.json", fingerprint: str = None):
         """Save PCA metadata to JSON file."""
         import json
-        metadata = self.get_pca_metadata()
+        metadata = self.get_pca_metadata(fingerprint)
         # Convert numpy types to Python types for JSON serialization
         def convert(obj):
             if isinstance(obj, (np.integer, np.floating)):
@@ -331,7 +336,14 @@ class AdvancedCustomerSegmentation:
 # Example Usage
 # ==========================================
 if __name__ == "__main__":
+    import hashlib
+    
     data_path = "customer_transactions_clean.parquet"
+    
+    # Compute fingerprint from file content for deterministic fingerprinting
+    with open(data_path, 'rb') as f:
+        file_content = f.read()
+    fingerprint = hashlib.sha256(file_content).hexdigest()[:16]
     
     pipeline = AdvancedCustomerSegmentation(max_clusters=8, n_components=6)
     segmented_customers = pipeline.fit_predict(data_path)
@@ -340,7 +352,8 @@ if __name__ == "__main__":
     segmented_customers.write_parquet("customer_segments_advanced.parquet")
     
     # Save PCA metadata for dashboard interpretability
-    pipeline.save_metadata("pca_metadata.json")
+    pipeline.save_metadata("pca_metadata.json", fingerprint)
     
     print("\nSaved segments to customer_segments_advanced.parquet")
     print("Saved PCA metadata to pca_metadata.json")
+    print(f"Source fingerprint: {fingerprint}")
