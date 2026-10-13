@@ -20,6 +20,8 @@ class AdvancedCustomerSegmentation:
         self.optimal_k = None
         self.model = None
         self._feature_names = None
+        self._pca_explained_variance = None
+        self._pca_loadings = None
 
     def validate_and_clean(self, lazy_df: pl.LazyFrame) -> pl.LazyFrame:
         """Enforces schema constraints using Polars expressions."""
@@ -172,12 +174,10 @@ class AdvancedCustomerSegmentation:
         data = data.fill_nan(0).fill_null(0)
         
         # 2. Winsorize extreme outliers at the 99th percentile using Polars
-        # Compute all 99th percentiles in one pass
         p99_exprs = [pl.col(c).quantile(0.99).alias(f"{c}_p99") for c in self._feature_names]
         p99_values = data.select(p99_exprs).row(0)
         p99_dict = dict(zip([f"{c}_p99" for c in self._feature_names], p99_values))
         
-        # Apply clipping
         clip_exprs = []
         for c in self._feature_names:
             p99 = p99_dict[f"{c}_p99"]
@@ -196,7 +196,6 @@ class AdvancedCustomerSegmentation:
             data = data.with_columns(log_exprs)
         
         # 4. RobustScaler equivalent in Polars: (x - median) / IQR
-        # Compute median and IQR for each column
         median_exprs = [pl.col(c).median().alias(f"{c}_median") for c in self._feature_names]
         q25_exprs = [pl.col(c).quantile(0.25).alias(f"{c}_q25") for c in self._feature_names]
         q75_exprs = [pl.col(c).quantile(0.75).alias(f"{c}_q75") for c in self._feature_names]
@@ -207,7 +206,6 @@ class AdvancedCustomerSegmentation:
         q25s = stats[n:2*n]
         q75s = stats[2*n:]
         
-        # Apply robust scaling
         scale_exprs = []
         for i, c in enumerate(self._feature_names):
             median = medians[i]
@@ -226,6 +224,11 @@ class AdvancedCustomerSegmentation:
         
         variance_explained = sum(self.pca.explained_variance_ratio_) * 100
         print(f"   -> PCA retains {variance_explained:.2f}% of the original behavioral variance.")
+        
+        # Save PCA metadata for interpretability
+        self._pca_explained_variance = self.pca.explained_variance_ratio_.tolist()
+        # Loadings: components_.T * sqrt(explained_variance) gives correlation of original features with PCs
+        self._pca_loadings = self.pca.components_.T.tolist()
         
         return pca_result, self._feature_names
 

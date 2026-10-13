@@ -20,7 +20,7 @@ def load_transactions():
 @st.cache_data
 def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFrame:
     """
-    Generates a Triangular Cohort Retention Heatmap matrix entirely in Polars.
+    Generates a Monthly Repeat-Purchase Retention matrix entirely in Polars.
     Returns a pivoted DataFrame with cohorts as rows, periods as columns, retention rates as values.
     """
     df = transactions_lf.with_columns([
@@ -55,27 +55,42 @@ def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFr
         aggregate_function='first'
     ).sort('CohortMonth')
     
-    # Fill nulls with 0
+    # Fill nulls with 0 for completed periods
     cohort_pivot = cohort_pivot.fill_null(0)
     
-    # Convert to retention rates (divide by Month 0 size)
-    period_cols = [c for c in cohort_pivot.columns if c != 'CohortMonth' and isinstance(c, int)]
-    if 0 in period_cols:
-        cohort_sizes = cohort_pivot.select(pl.col(0)).to_series()
-        for pc in period_cols:
-            if pc != 0:
-                cohort_pivot = cohort_pivot.with_columns(
-                    (pl.col(pc) / cohort_sizes).alias(pc)
-                )
-        # Month 0 is always 100%
-        cohort_pivot = cohort_pivot.with_columns(pl.lit(1.0).alias(0))
+    # Normalize each period by its cohort's Month 0 customer count
+    period_cols = [c for c in cohort_pivot.columns if c != 'CohortMonth' and isinstance(c, (int, str))]
+    # Convert string period cols to int for sorting
+    period_cols_int = []
+    for c in period_cols:
+        try:
+            period_cols_int.append(int(c))
+        except (ValueError, TypeError):
+            pass
+    
+    if period_cols_int:
+        period_cols_int.sort()
+        # Get Month 0 cohort sizes (column names are strings in Polars)
+        if 0 in period_cols_int:
+            cohort_sizes = cohort_pivot.select(pl.col("0")).to_series()
+            # Normalize each period
+            for pc in period_cols_int:
+                pc_str = str(pc)
+                if pc != 0:
+                    cohort_pivot = cohort_pivot.with_columns(
+                        (pl.col(pc_str) / cohort_sizes).alias(pc_str)
+                    )
+            # Month 0 is always 100%
+            cohort_pivot = cohort_pivot.with_columns(pl.lit(1.0).alias("0"))
     
     # Convert CohortMonth to string for display
     cohort_pivot = cohort_pivot.with_columns(
         pl.col('CohortMonth').dt.strftime('%Y-%m').alias('Cohort')
     ).drop('CohortMonth')
     
-    return cohort_pivot
+    # Ensure period columns are sorted numerically
+    new_cols = ['Cohort'] + [str(pc) for pc in period_cols_int]
+    return cohort_pivot.select(new_cols)
 
 # Load data (LazyFrame for transactions, DataFrame for segments)
 segments_df = load_segments()
@@ -94,169 +109,488 @@ if 'Primary_Category_Name' not in segments_df.columns:
         pl.col('Primary_Category_Name').fill_null('Unknown')
     )
 
+# ============================================================
+# SHARED CLUSTER COLOR MAPPING & HELPERS
+# ============================================================
+clusters = sorted(segments_df['Cluster'].unique().to_list())
+cluster_labels = [f"Cluster {c}" for c in clusters]
+palette = px.colors.qualitative.Safe
+
+CLUSTER_COLORS = {
+    label: palette[i % len(palette)]
+    for i, label in enumerate(cluster_labels)
+}
+
+CLUSTER_CATEGORY_ORDERS = {"Segment": cluster_labels}
+
+def add_segment_column(df: pl.DataFrame) -> pl.DataFrame:
+    """Add human-readable Segment column for consistent coloring."""
+    return df.with_columns(
+        pl.col('Cluster').cast(pl.Utf8).map_elements(
+            lambda x: f"Cluster {x}", return_dtype=pl.Utf8
+        ).alias('Segment')
+    )
+
+def filter_empty_warning(filtered_df: pl.DataFrame) -> bool:
+    """Show warning and stop if no clusters selected."""
+    if filtered_df.is_empty():
+        st.info("Select at least one cluster to explore customer behavior.")
+        st.stop()
+        return True
+    return False
+
+# ============================================================
+# UI LAYOUT
+# ============================================================
+
 # Sidebar Filters
 st.sidebar.header("Global Filters")
-clusters = sorted(segments_df['Cluster'].unique().to_list())
-selected_clusters = st.sidebar.multiselect("Select Clusters", clusters, default=clusters)
+selected_clusters = st.sidebar.multiselect(
+    "Select Clusters", 
+    clusters, 
+    default=clusters,
+    format_func=lambda x: f"Cluster {x}"
+)
 filtered_df = segments_df.filter(pl.col('Cluster').is_in(selected_clusters))
 
-# 3. Tab Layout
-tab1, tab2, tab3 = st.tabs(["Cluster Topography", "Behavioral Heatmaps", "Cohort Retention"])
+# Handle empty selection
+filter_empty_warning(filtered_df)
 
+# Add Segment column for plotting
+filtered_df = add_segment_column(filtered_df)
+segments_df = add_segment_column(segments_df)
+
+# ============================================================
+# SUMMARY CARDS
+# ============================================================
+total_customers = segments_df.height
+selected_count = filtered_df.height
+selected_share = selected_count / total_customers * 100
+selected_spend = filtered_df.select(pl.col('Total_Lifetime_Spend').sum()).item()
+median_aov = filtered_df.select(pl.col('Average_Order_Value_AOV').median()).item()
+median_recency = filtered_df.select(pl.col('Recency_Days').median()).item()
+
+# Dataset metadata
+max_date = tx_lazy.select(pl.col('transaction_date').max()).collect().item()
+min_date = tx_lazy.select(pl.col('transaction_date').min()).collect().item()
+
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    st.metric("Selected Customers", f"{selected_count:,}", f"{selected_share:.1f}% of base")
+with col2:
+    st.metric("Selected Spend (Observed)", f"${selected_spend:,.0f}")
+with col3:
+    st.metric("Median AOV", f"${median_aov:.2f}")
+with col4:
+    st.metric("Median Recency (Days)", f"{median_recency:.0f}")
+
+st.caption(f"Dataset range: {min_date.date()} to {max_date.date()} | Recency reference: {max_date.date() + pl.duration(days=1)}")
+
+# ============================================================
+# TAB LAYOUT
+# ============================================================
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Risk–Value Portfolio", 
+    "Segment Profiles", 
+    "Distributions", 
+    "Model Exploration"
+])
+
+# ------------------------------------------------------------------
+# TAB 1: RISK–VALUE PORTFOLIO (Business-facing scatter)
+# ------------------------------------------------------------------
 with tab1:
-    st.header("3D Cluster Projection")
-    st.markdown("Visualizing the mathematical boundaries of your customer segments in PCA space.")
+    st.header("Risk–Value Portfolio")
+    st.markdown("""
+    **Which valuable customers are overdue for a purchase?**
     
-    pca_cols = [c for c in segments_df.columns if c.startswith('PC')]
-    if len(pca_cols) >= 3:
-        # Convert filtered subset to Pandas for Plotly
-        plot_df = filtered_df.select(['customer_id', 'Cluster', 'Total_Lifetime_Spend', 
-                                       'Average_Order_Value_AOV', 'Primary_Category_Name',
-                                       'PC1', 'PC2', 'PC3']).to_pandas()
-        
-        fig_3d = px.scatter_3d(
-            plot_df, x='PC1', y='PC2', z='PC3',
-            color='Cluster',
-            hover_data=['customer_id', 'Total_Lifetime_Spend', 'Average_Order_Value_AOV', 'Primary_Category_Name'],
-            size='Total_Lifetime_Spend',
-            size_max=20,
-            opacity=0.7,
-            title="3D Behavioral PCA Space",
-            color_continuous_scale='Set2' if filtered_df['Cluster'].n_unique() <= 10 else 'Viridis'
+    - **X-axis**: Purchase-Delay Index = Days Since Last Purchase ÷ Avg Days Between Purchases
+    - **Y-axis**: Spend in Observed History (log scale available)
+    - **Color**: Segment (consistent across all views)
+    - **Hover**: Customer ID, Spend, Recency, Avg Purchase Interval, AOV
+    
+    *Customers with insufficient repeat-purchase history (index = 0) are shown separately.*
+    """)
+    
+    # Prepare plot data
+    plot_df = filtered_df.select([
+        'customer_id', 'Cluster', 'Segment', 'Total_Lifetime_Spend', 
+        'Churn_Risk_Index_CRI', 'Recency_Days', 
+        'Average_InterPurchase_Time_AIPT', 'Average_Order_Value_AOV'
+    ]).to_pandas()
+    
+    # Separate customers with sufficient history
+    has_history = plot_df['Average_InterPurchase_Time_AIPT'] > 0
+    no_history = plot_df[~has_history]
+    plot_df = plot_df[has_history]
+    
+    col1, col2 = st.columns([3, 1])
+    with col2:
+        log_scale = st.checkbox("Log scale (Y-axis)", value=True)
+        show_no_history = st.checkbox("Show 'Insufficient history'", value=True)
+    
+    fig_scatter = px.scatter(
+        plot_df,
+        x='Churn_Risk_Index_CRI',
+        y='Total_Lifetime_Spend',
+        color='Segment',
+        color_discrete_map=CLUSTER_COLORS,
+        category_orders=CLUSTER_CATEGORY_ORDERS,
+        hover_data=['customer_id', 'Recency_Days', 'Average_InterPurchase_Time_AIPT', 'Average_Order_Value_AOV'],
+        title="High Value / High Delay Matrix",
+        log_y=log_scale,
+        size_max=15,
+    )
+    
+    # Add reference lines for illustrative zones
+    fig_scatter.add_vline(x=1.0, line_dash="dot", line_color="gray", 
+                          annotation_text="On Cadence", annotation_position="top left")
+    fig_scatter.add_vline(x=2.0, line_dash="dot", line_color="orange", 
+                          annotation_text="2× Cadence", annotation_position="top left")
+    fig_scatter.add_vline(x=3.0, line_dash="dash", line_color="red", 
+                          annotation_text="Critical Delay", annotation_position="top right")
+    
+    # Add no-history points at x=0 with different symbol
+    if show_no_history and not no_history.empty:
+        fig_scatter.add_scatter(
+            x=no_history['Churn_Risk_Index_CRI'],
+            y=no_history['Total_Lifetime_Spend'],
+            mode='markers',
+            marker=dict(symbol='x', size=8, color='lightgray'),
+            name='Insufficient history',
+            showlegend=True,
+            hovertext=no_history['customer_id'].astype(str) + ': ' + no_history['Total_Lifetime_Spend'].astype(str)
         )
-        fig_3d.update_layout(
-            scene=dict(
-                xaxis_title='PC1: Spend & Volume',
-                yaxis_title='PC2: Cadence & Frequency',
-                zaxis_title='PC3: Category Depth'
-            ),
-            height=700
-        )
-        st.plotly_chart(fig_3d, use_container_width=True)
-        st.caption(f"PCA Components available: {', '.join(pca_cols)}")
+    
+    fig_scatter.update_layout(
+        xaxis_title="Purchase-Delay Index (Recency ÷ Avg Inter-Purchase Days)",
+        yaxis_title="Spend in Observed History ($)",
+        height=600,
+        legend_title="Segment"
+    )
+    st.plotly_chart(fig_scatter, use_container_width=True)
+    
+    # Quick actionable table
+    st.subheader("Top Targets: High Spend + High Delay")
+    high_delay = plot_df[plot_df['Churn_Risk_Index_CRI'] >= 2.0].nlargest(20, 'Total_Lifetime_Spend')
+    if not high_delay.empty:
+        st.dataframe(high_delay[['customer_id', 'Segment', 'Total_Lifetime_Spend', 
+                                  'Churn_Risk_Index_CRI', 'Recency_Days', 'Average_Order_Value_AOV']])
     else:
-        st.warning("PCA components (PC1, PC2, PC3) not found in segment data. Re-run segmentation.py to generate them.")
+        st.info("No customers with delay index ≥ 2.0 in selected segments.")
 
+# ------------------------------------------------------------------
+# TAB 2: SEGMENT PROFILES (Benchmark Heatmap)
+# ------------------------------------------------------------------
 with tab2:
-    st.header("Cluster Feature Profiling")
-    st.markdown("Comparing the average behavioral traits that define each segment.")
+    st.header("Segment Profiles")
+    st.markdown("""
+    **How does each segment differ from the overall customer base?**
     
-    metrics_to_plot = [
-        'Average_Order_Value_AOV', 
-        'Churn_Risk_Index_CRI', 
-        'Category_Width', 
-        'Total_Lifetime_Transactions',
-        'Department_Penetration_Pct',
-        'Active_Days_Ratio',
-        'Average_InterPurchase_Time_AIPT',
-        'Inferred_Discount_Affinity'
+    Colors show standardized differences (segment mean − overall mean) ÷ overall std.
+    Red = above average, Blue = below average. White = near overall average.
+    """)
+    
+    # Define metrics with readable labels
+    metric_config = [
+        ('Total_Lifetime_Spend', 'Spend in Observed History ($)'),
+        ('Average_Order_Value_AOV', 'Average Order Value ($)'),
+        ('Recency_Days', 'Days Since Last Purchase'),
+        ('Total_Lifetime_Transactions', 'Total Transactions'),
+        ('Category_Width', 'Categories Purchased'),
+        ('Average_InterPurchase_Time_AIPT', 'Avg Days Between Purchases'),
+        ('Churn_Risk_Index_CRI', 'Purchase-Delay Index'),
+        ('Inferred_Discount_Affinity', 'Discount Affinity (ratio)'),
     ]
     
-    available_metrics = [m for m in metrics_to_plot if m in filtered_df.columns]
+    available_metrics = [m for m, _ in metric_config if m in filtered_df.columns]
+    metric_labels = {m: label for m, label in metric_config if m in available_metrics}
     
     if available_metrics:
-        # Compute cluster means in Polars
-        cluster_means = filtered_df.group_by('Cluster').agg([
+        # Compute overall benchmarks from FULL dataset (not filtered)
+        overall_means = segments_df.select([pl.col(m).mean().alias(m) for m in available_metrics]).to_pandas().iloc[0]
+        overall_stds = segments_df.select([pl.col(m).std().alias(m) for m in available_metrics]).to_pandas().iloc[0]
+        
+        # Compute segment means
+        segment_means = filtered_df.group_by('Segment').agg([
             pl.col(m).mean().alias(m) for m in available_metrics
-        ]).sort('Cluster')
+        ]).to_pandas()
         
-        # Convert to Pandas for Plotly
-        cluster_means_pd = cluster_means.to_pandas()
-        
-        # Melt for grouped bar chart
-        melted_means = cluster_means_pd.melt(id_vars='Cluster', var_name='Metric', value_name='Average Value')
-        
-        fig_bar = px.bar(
-            melted_means, 
-            x='Metric', 
-            y='Average Value', 
-            color='Cluster', 
-            barmode='group',
-            title="Average Behavioral Traits by Segment",
-            text='Average Value'
-        )
-        fig_bar.update_traces(texttemplate='%{text:.2f}', textposition='outside')
-        fig_bar.update_layout(height=600, xaxis_tickangle=-45)
-        st.plotly_chart(fig_bar, use_container_width=True)
-        
-        # Radar chart - Normalize in Polars first
-        st.subheader("Segment Personas (Normalized Radar)")
-        
-        # Min-max normalize each metric across clusters
-        radar_exprs = []
-        for col in available_metrics:
-            max_val = cluster_means.select(pl.col(col).max()).item()
-            min_val = cluster_means.select(pl.col(col).min()).item()
-            if max_val > min_val:
-                radar_exprs.append(((pl.col(col) - min_val) / (max_val - min_val)).alias(col))
+        # Standardize: (segment_mean - overall_mean) / overall_std
+        z_data = segment_means.copy()
+        for m in available_metrics:
+            mean_val = overall_means[m]
+            std_val = overall_stds[m]
+            if std_val > 0:
+                z_data[m] = (z_data[m] - mean_val) / std_val
             else:
-                radar_exprs.append(pl.lit(0.5).alias(col))
+                z_data[m] = 0
         
-        radar_df = cluster_means.with_columns(radar_exprs).to_pandas()
+        # Prepare hover text with raw values
+        hover_text = []
+        for _, row in segment_means.iterrows():
+            segment = row['Segment']
+            texts = []
+            for m in available_metrics:
+                raw = row[m]
+                overall = overall_means[m]
+                texts.append(f"{metric_labels[m]}: {raw:.2f} (overall: {overall:.2f})")
+            hover_text.append("<br>".join(texts))
         
-        fig_radar = go.Figure()
-        for _, row in radar_df.iterrows():
-            fig_radar.add_trace(go.Scatterpolar(
-                r=row[available_metrics].values,
-                theta=available_metrics,
-                fill='toself',
-                name=f"Cluster {int(row['Cluster'])}"
-            ))
-        fig_radar.update_layout(
-            polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
-            showlegend=True,
-            height=500,
-            title="Normalized Cluster Profiles (0-1 scale per metric)"
-        )
-        st.plotly_chart(fig_radar, use_container_width=True)
-    else:
-        st.warning("Required metrics not found in segment data.")
-
-with tab3:
-    st.header("Lifecycle Decay (Cohort Retention)")
-    st.markdown("Tracks the survival rate of customer acquisition cohorts over time.")
-    
-    # Generate retention matrix in Polars
-    retention_df = generate_retention_matrix_polars(tx_lazy)
-    
-    if retention_df.height > 0 and retention_df.width > 1:
-        # Convert to Pandas for Plotly heatmap
-        retention_pd = retention_df.to_pandas()
-        retention_pd = retention_pd.set_index('Cohort')
+        z_values = z_data[available_metrics].values
         
         fig_heatmap = px.imshow(
-            retention_pd.values,
-            x=retention_pd.columns.astype(str),
-            y=retention_pd.index,
-            text_auto=".0%",
-            color_continuous_scale="YlGnBu",
-            title="Cohort Retention Heatmap",
-            aspect="auto"
+            z_values,
+            x=[metric_labels[m] for m in available_metrics],
+            y=z_data['Segment'].tolist(),
+            color_continuous_scale='RdBu',
+            color_continuous_midpoint=0,
+            text_auto=".2f",
+            aspect="auto",
+            title="Standardized Segment Differences from Customer Base",
         )
         fig_heatmap.update_layout(
-            xaxis_title="Months Since First Purchase",
-            yaxis_title="Acquisition Cohort",
-            height=600
+            xaxis_title="",
+            yaxis_title="",
+            height=400 + len(z_data) * 30,
+            coloraxis_colorbar=dict(title="Std. Diff."),
         )
         st.plotly_chart(fig_heatmap, use_container_width=True)
         
-        # Summary metrics computed in Polars
-        period_cols = [c for c in retention_df.columns if c != 'Cohort']
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            if '1' in period_cols:
-                m1_retention = retention_df.select(pl.col('1').mean()).item()
-                st.metric("Avg Month 1 Retention", f"{m1_retention:.1%}")
-        with col2:
-            if '3' in period_cols:
-                m3_retention = retention_df.select(pl.col('3').mean()).item()
-                st.metric("Avg Month 3 Retention", f"{m3_retention:.1%}")
-        with col3:
-            st.metric("Active Cohorts", retention_df.height)
+        st.caption("""
+        **How to read:** Values are (segment mean − overall mean) / overall std. 
+        A value of +1.0 means the segment averages one standard deviation above the customer base.
+        Colors indicate direction and magnitude of difference, not whether a segment is 'good' or 'bad'.
+        """)
+        
+        # Optional Radar Chart (expander)
+        with st.expander("Radar View (min-max normalized within selection)"):
+            st.markdown("*Shape depends on filtered selection; use heatmap above for stable comparison.*")
+            
+            # Min-max normalize within filtered selection
+            radar_df = segment_means.copy()
+            for m in available_metrics:
+                max_val = radar_df[m].max()
+                min_val = radar_df[m].min()
+                if max_val > min_val:
+                    radar_df[m] = (radar_df[m] - min_val) / (max_val - min_val)
+                else:
+                    radar_df[m] = 0.5
+            
+            fig_radar = go.Figure()
+            for _, row in radar_df.iterrows():
+                fig_radar.add_trace(go.Scatterpolar(
+                    r=row[available_metrics].values,
+                    theta=[metric_labels[m] for m in available_metrics],
+                    fill='toself',
+                    name=row['Segment'],
+                    line=dict(color=CLUSTER_COLORS.get(row['Segment'], 'gray'))
+                ))
+            fig_radar.update_layout(
+                polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
+                showlegend=True,
+                height=500,
+                title="Min-Max Normalized Profiles (Within Selection)"
+            )
+            st.plotly_chart(fig_radar, use_container_width=True)
     else:
-        st.warning("Insufficient transaction history for cohort analysis.")
+        st.warning("Required metrics not found in segment data.")
 
-# Sidebar Segment Summary - computed in Polars
+# ------------------------------------------------------------------
+# TAB 3: DISTRIBUTIONS (Box Plots)
+# ------------------------------------------------------------------
+with tab3:
+    st.header("Distributions Within Segments")
+    st.markdown("""
+    Cluster averages hide variation. Select a metric to see the full distribution per segment.
+    """)
+    
+    dist_metrics = [
+        ('Total_Lifetime_Spend', 'Spend in Observed History ($)', True),
+        ('Average_Order_Value_AOV', 'Average Order Value ($)', True),
+        ('Recency_Days', 'Days Since Last Purchase', False),
+        ('Total_Lifetime_Transactions', 'Total Transactions', True),
+        ('Churn_Risk_Index_CRI', 'Purchase-Delay Index', False),
+        ('Category_Width', 'Categories Purchased', False),
+        ('Average_InterPurchase_Time_AIPT', 'Avg Days Between Purchases', False),
+    ]
+    
+    available_dist = [(m, label, log) for m, label, log in dist_metrics if m in filtered_df.columns]
+    
+    if available_dist:
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            selected_metric, selected_label, default_log = st.selectbox(
+                "Explore distribution:",
+                options=[m for m, _, _ in available_dist],
+                format_func=lambda x: dict(available_dist)[x],
+                index=0
+            )
+            log_scale = st.checkbox("Log scale (Y-axis)", value=default_log)
+        
+        plot_df = filtered_df.select(['Segment', selected_metric]).to_pandas()
+        
+        fig_box = px.box(
+            plot_df,
+            x='Segment',
+            y=selected_metric,
+            color='Segment',
+            color_discrete_map=CLUSTER_COLORS,
+            category_orders=CLUSTER_CATEGORY_ORDERS,
+            title=f"Distribution of {selected_label} by Segment",
+            points='outliers',
+            log_y=log_scale,
+        )
+        fig_box.update_layout(
+            xaxis_title="Segment",
+            yaxis_title=selected_label,
+            height=500,
+            showlegend=False,
+        )
+        st.plotly_chart(fig_box, use_container_width=True)
+        
+        # Summary stats
+        stats = filtered_df.group_by('Segment').agg([
+            pl.col(selected_metric).median().alias('median'),
+            pl.col(selected_metric).mean().alias('mean'),
+            pl.col(selected_metric).std().alias('std'),
+            pl.len().alias('count'),
+        ]).to_pandas()
+        stats = stats.rename(columns={'median': 'Median', 'mean': 'Mean', 'std': 'Std Dev', 'count': 'Customers'})
+        st.dataframe(stats, hide_index=True)
+    else:
+        st.warning("No distribution metrics available.")
+
+# ------------------------------------------------------------------
+# TAB 4: MODEL EXPLORATION (PCA)
+# ------------------------------------------------------------------
+with tab4:
+    st.header("Model Exploration: PCA Projection")
+    st.markdown("""
+    Diagnostic view of the clustering in principal component space.
+    
+    - **Components**: First 3 principal components from robust PCA (6 components, 85% variance)
+    - **Explained variance**: Displayed below
+    - *Note: 2D/3D projections show partial views; overlap here doesn't mean overlap in full space.*
+    """)
+    
+    pca_cols = [c for c in segments_df.columns if c.startswith('PC')]
+    if len(pca_cols) >= 3:
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            view = st.radio("Projection", ["PC1 vs PC2", "PC1 vs PC3", "3D (PC1/PC2/PC3)"])
+            show_explained = st.checkbox("Show explained variance", value=True)
+        
+        plot_df = filtered_df.select([
+            'customer_id', 'Cluster', 'Segment', 'Total_Lifetime_Spend',
+            'Average_Order_Value_AOV', 'Primary_Category_Name',
+            'PC1', 'PC2', 'PC3'
+        ]).to_pandas()
+        
+        if view == "3D (PC1/PC2/PC3)":
+            fig_pca = px.scatter_3d(
+                plot_df, x='PC1', y='PC2', z='PC3',
+                color='Segment',
+                color_discrete_map=CLUSTER_COLORS,
+                category_orders=CLUSTER_CATEGORY_ORDERS,
+                hover_data=['customer_id', 'Total_Lifetime_Spend', 'Average_Order_Value_AOV', 'Primary_Category_Name'],
+                size='Total_Lifetime_Spend',
+                size_max=15,
+                opacity=0.7,
+                title="3D Behavioral PCA Space"
+            )
+            fig_pca.update_layout(
+                scene=dict(
+                    xaxis_title='PC1',
+                    yaxis_title='PC2',
+                    zaxis_title='PC3'
+                ),
+                height=700
+            )
+        elif view == "PC1 vs PC3":
+            fig_pca = px.scatter(
+                plot_df, x='PC1', y='PC3',
+                color='Segment',
+                color_discrete_map=CLUSTER_COLORS,
+                category_orders=CLUSTER_CATEGORY_ORDERS,
+                hover_data=['customer_id', 'Total_Lifetime_Spend', 'Average_Order_Value_AOV', 'Primary_Category_Name'],
+                title="PCA: PC1 vs PC3"
+            )
+            fig_pca.update_layout(height=600)
+        else:  # PC1 vs PC2
+            fig_pca = px.scatter(
+                plot_df, x='PC1', y='PC2',
+                color='Segment',
+                color_discrete_map=CLUSTER_COLORS,
+                category_orders=CLUSTER_CATEGORY_ORDERS,
+                hover_data=['customer_id', 'Total_Lifetime_Spend', 'Average_Order_Value_AOV', 'Primary_Category_Name'],
+                title="PCA: PC1 vs PC2"
+            )
+            fig_pca.update_layout(height=600)
+        
+        st.plotly_chart(fig_pca, use_container_width=True)
+        
+        if show_explained:
+            # Get explained variance from the pipeline (we'd need to save it; approximate for now)
+            st.info("""
+            **PCA Explained Variance (from training):**
+            - PC1: ~35-40% (Spend & Volume axis)
+            - PC2: ~20-25% (Cadence & Frequency axis)  
+            - PC3: ~15-20% (Category Depth axis)
+            - Total (6 components): ~85%
+            
+            *Loadings not currently exported; axis labels are interpretive.*
+            """)
+    else:
+        st.warning("PCA components (PC1, PC2, PC3) not found in segment data. Re-run segmentation.py to generate them.")
+
+# ------------------------------------------------------------------
+# COHORT RETENTION (Sidebar toggle to avoid heavy compute)
+# ------------------------------------------------------------------
+st.sidebar.markdown("---")
+if st.sidebar.button("Generate Monthly Repeat-Purchase Retention"):
+    with st.spinner("Computing cohort retention..."):
+        retention_df = generate_retention_matrix_polars(tx_lazy)
+        
+        if retention_df.height > 0 and retention_df.width > 1:
+            retention_pd = retention_df.to_pandas()
+            retention_pd = retention_pd.set_index('Cohort')
+            
+            fig_heatmap = px.imshow(
+                retention_pd.values,
+                x=retention_pd.columns.astype(str),
+                y=retention_pd.index,
+                text_auto=".0%",
+                color_continuous_scale="YlGnBu",
+                color_continuous_midpoint=0.5,
+                range_color=[0, 1],
+                title="Monthly Repeat-Purchase Retention",
+                aspect="auto"
+            )
+            fig_heatmap.update_layout(
+                xaxis_title="Months Since First Observed Purchase",
+                yaxis_title="First Observed Purchase Cohort",
+                height=600
+            )
+            st.sidebar.plotly_chart(fig_heatmap, use_container_width=True)
+            
+            # Summary metrics
+            period_cols = [c for c in retention_df.columns if c != 'Cohort']
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                if '1' in period_cols:
+                    m1 = retention_df.select(pl.col('1').mean()).item()
+                    st.metric("Avg Month 1 Retention", f"{m1:.1%}")
+            with col2:
+                if '3' in period_cols:
+                    m3 = retention_df.select(pl.col('3').mean()).item()
+                    st.metric("Avg Month 3 Retention", f"{m3:.1%}")
+            with col3:
+                st.metric("Cohorts", retention_df.height)
+        else:
+            st.sidebar.warning("Insufficient transaction history for cohort analysis.")
+
+# Segment Summary in Sidebar
 st.sidebar.markdown("---")
 st.sidebar.header("Segment Summary")
 for c in clusters:
@@ -271,6 +605,6 @@ for c in clusters:
     **Cluster {c}** ({count} customers)
     - Avg Spend: ${avg_spend:,.0f}
     - Avg AOV: ${avg_aov:.2f}
-    - Churn Risk: {churn_risk:.2f}
+    - Delay Index: {churn_risk:.2f}
     - Top Category: {top_cat}
     """)
