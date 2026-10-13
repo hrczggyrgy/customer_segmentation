@@ -3,19 +3,52 @@ import polars as pl
 import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
+import io
 
 # 1. Page Configuration
 st.set_page_config(page_title="Advanced Customer Analytics", layout="wide")
 st.title("Customer Intelligence Platform")
 
-# 2. Data Loaders (Cached for performance) - Keep in Polars!
+# 2. File Upload (for Streamlit Cloud deployment)
+st.sidebar.header("📁 Data Upload")
+st.sidebar.markdown("Upload your own parquet files, or use the built-in sample data.")
+
+uploaded_segments = st.sidebar.file_uploader(
+    "Segments Parquet (customer_segments_advanced.parquet)",
+    type=["parquet"],
+    help="Output from segmentation.py with PCA components"
+)
+
+uploaded_transactions = st.sidebar.file_uploader(
+    "Transactions Parquet (customer_transactions_clean.parquet)",
+    type=["parquet"],
+    help="Cleaned transaction data for cohort analysis"
+)
+
+# 3. Data Loaders (Cached for performance) - Keep in Polars!
 @st.cache_data
-def load_segments():
-    return pl.read_parquet("customer_segments_advanced.parquet")
+def load_segments_from_file(uploaded_file):
+    """Load segments from uploaded file or local fallback."""
+    if uploaded_file is not None:
+        return pl.read_parquet(io.BytesIO(uploaded_file.read()))
+    # Fallback to local file
+    try:
+        return pl.read_parquet("customer_segments_advanced.parquet")
+    except FileNotFoundError:
+        st.error("No segments file found. Please upload a parquet file or place 'customer_segments_advanced.parquet' in the app directory.")
+        st.stop()
 
 @st.cache_data
-def load_transactions():
-    return pl.read_parquet("customer_transactions_clean.parquet")
+def load_transactions_from_file(uploaded_file):
+    """Load transactions from uploaded file or local fallback."""
+    if uploaded_file is not None:
+        return pl.read_parquet(io.BytesIO(uploaded_file.read()))
+    # Fallback to local file
+    try:
+        return pl.read_parquet("customer_transactions_clean.parquet")
+    except FileNotFoundError:
+        st.warning("No transactions file found. Cohort retention will be unavailable. Upload 'customer_transactions_clean.parquet' or place it locally.")
+        return None
 
 @st.cache_data
 def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFrame:
@@ -93,8 +126,9 @@ def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFr
     return cohort_pivot.select(new_cols)
 
 # Load data (LazyFrame for transactions, DataFrame for segments)
-segments_df = load_segments()
-tx_lazy = load_transactions().lazy()
+segments_df = load_segments_from_file(uploaded_segments)
+tx_df = load_transactions_from_file(uploaded_transactions)
+tx_lazy = tx_df.lazy() if tx_df is not None else None
 
 # Add Primary_Category_Name if missing (derive from transactions in Polars)
 if 'Primary_Category_Name' not in segments_df.columns:
@@ -548,47 +582,51 @@ with tab4:
 # COHORT RETENTION (Sidebar toggle to avoid heavy compute)
 # ------------------------------------------------------------------
 st.sidebar.markdown("---")
-if st.sidebar.button("Generate Monthly Repeat-Purchase Retention"):
-    with st.spinner("Computing cohort retention..."):
-        retention_df = generate_retention_matrix_polars(tx_lazy)
-        
-        if retention_df.height > 0 and retention_df.width > 1:
-            retention_pd = retention_df.to_pandas()
-            retention_pd = retention_pd.set_index('Cohort')
+
+if tx_lazy is None:
+    st.sidebar.warning("⚠️ No transactions data uploaded. Cohort retention unavailable.")
+else:
+    if st.sidebar.button("Generate Monthly Repeat-Purchase Retention"):
+        with st.spinner("Computing cohort retention..."):
+            retention_df = generate_retention_matrix_polars(tx_lazy)
             
-            fig_heatmap = px.imshow(
-                retention_pd.values,
-                x=retention_pd.columns.astype(str),
-                y=retention_pd.index,
-                text_auto=".0%",
-                color_continuous_scale="YlGnBu",
-                color_continuous_midpoint=0.5,
-                range_color=[0, 1],
-                title="Monthly Repeat-Purchase Retention",
-                aspect="auto"
-            )
-            fig_heatmap.update_layout(
-                xaxis_title="Months Since First Observed Purchase",
-                yaxis_title="First Observed Purchase Cohort",
-                height=600
-            )
-            st.sidebar.plotly_chart(fig_heatmap, use_container_width=True)
-            
-            # Summary metrics
-            period_cols = [c for c in retention_df.columns if c != 'Cohort']
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                if '1' in period_cols:
-                    m1 = retention_df.select(pl.col('1').mean()).item()
-                    st.metric("Avg Month 1 Retention", f"{m1:.1%}")
-            with col2:
-                if '3' in period_cols:
-                    m3 = retention_df.select(pl.col('3').mean()).item()
-                    st.metric("Avg Month 3 Retention", f"{m3:.1%}")
-            with col3:
-                st.metric("Cohorts", retention_df.height)
-        else:
-            st.sidebar.warning("Insufficient transaction history for cohort analysis.")
+            if retention_df.height > 0 and retention_df.width > 1:
+                retention_pd = retention_df.to_pandas()
+                retention_pd = retention_pd.set_index('Cohort')
+                
+                fig_heatmap = px.imshow(
+                    retention_pd.values,
+                    x=retention_pd.columns.astype(str),
+                    y=retention_pd.index,
+                    text_auto=".0%",
+                    color_continuous_scale="YlGnBu",
+                    color_continuous_midpoint=0.5,
+                    range_color=[0, 1],
+                    title="Monthly Repeat-Purchase Retention",
+                    aspect="auto"
+                )
+                fig_heatmap.update_layout(
+                    xaxis_title="Months Since First Observed Purchase",
+                    yaxis_title="First Observed Purchase Cohort",
+                    height=600
+                )
+                st.sidebar.plotly_chart(fig_heatmap, use_container_width=True)
+                
+                # Summary metrics
+                period_cols = [c for c in retention_df.columns if c != 'Cohort']
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    if '1' in period_cols:
+                        m1 = retention_df.select(pl.col('1').mean()).item()
+                        st.metric("Avg Month 1 Retention", f"{m1:.1%}")
+                with col2:
+                    if '3' in period_cols:
+                        m3 = retention_df.select(pl.col('3').mean()).item()
+                        st.metric("Avg Month 3 Retention", f"{m3:.1%}")
+                with col3:
+                    st.metric("Cohorts", retention_df.height)
+            else:
+                st.sidebar.warning("Insufficient transaction history for cohort analysis.")
 
 # Segment Summary in Sidebar
 st.sidebar.markdown("---")
