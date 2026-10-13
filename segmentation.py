@@ -1,20 +1,21 @@
 import polars as pl
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
+from sklearn.metrics import davies_bouldin_score
 import warnings
 
 warnings.filterwarnings('ignore')
+
 
 class AdvancedCustomerSegmentation:
     def __init__(self, max_clusters=10, n_components=6, random_state=42):
         self.max_clusters = max_clusters
         self.random_state = random_state
-        self.n_components = n_components # PCA components
-        self.scaler = StandardScaler()
+        self.n_components = n_components
+        self.scaler = RobustScaler()
         self.pca = PCA(n_components=self.n_components, random_state=self.random_state)
         self.optimal_k = None
         self.model = None
@@ -154,7 +155,12 @@ class AdvancedCustomerSegmentation:
         return final_metrics.drop(cols_to_drop)
 
     def _preprocess_data(self, features_df: pd.DataFrame) -> np.ndarray:
-        """Cleans NaNs, applies Log1p, Scales, and reduces dimensionality via PCA."""
+        """
+        Robust preprocessing pipeline:
+        1. Winsorization at 99th percentile to cap extreme outliers
+        2. RobustScaler (median/IQR) immune to outlier pull
+        3. PCA dimensionality reduction
+        """
         numeric_cols = features_df.drop('customer_id', axis=1).columns
         data = features_df[numeric_cols].copy()
         
@@ -162,16 +168,23 @@ class AdvancedCustomerSegmentation:
         data.replace([np.inf, -np.inf], np.nan, inplace=True)
         data.fillna(0, inplace=True)
         
-        # 2. Log transform highly skewed financial metrics
+        # 2. Winsorize extreme outliers at the 99th percentile
+        # This caps the heavy tails that dominate variance in retail data
+        for col in data.columns:
+            p99 = data[col].quantile(0.99)
+            data[col] = np.clip(data[col], a_min=None, a_max=p99)
+            
+        # 3. Log transform highly skewed financial metrics (after winsorization)
         skewed_cols = ['Total_Lifetime_Spend', 'Total_Lifetime_Units', 'Max_Basket_Value', 'Average_Order_Value_AOV']
         for col in skewed_cols:
             if col in data.columns:
                 data[col] = np.log1p(np.maximum(data[col], 0))
-                
-        # 3. Standardize Data
+                 
+        # 4. Standardize Data using RobustScaler (median/IQR)
+        # Unlike StandardScaler, RobustScaler ignores the pull of massive outliers
         scaled_array = self.scaler.fit_transform(data)
         
-        # 4. Dimensionality Reduction (PCA)
+        # 5. Dimensionality Reduction (PCA)
         print(f"   -> Reducing {len(numeric_cols)} features to {self.n_components} principal components...")
         pca_result = self.pca.fit_transform(scaled_array)
         
@@ -181,18 +194,28 @@ class AdvancedCustomerSegmentation:
         return pca_result
 
     def _find_optimal_k(self, pca_data: np.ndarray) -> int:
-        best_k = 2
-        best_score = -1
+        """
+        Optimize cluster count using Davies-Bouldin Index.
         
-        for k in range(2, self.max_clusters + 1):
+        Davies-Bouldin is preferred over Silhouette for dense retail distributions
+        because it measures intra-cluster similarity vs inter-cluster separation
+        without penalizing compact clusters. Lower score = better separation.
+        """
+        best_k = 3  # Force minimum 3 clusters for actionable CRM segmentation
+        best_score = float('inf')  # Lower is better for Davies-Bouldin
+        
+        for k in range(3, self.max_clusters + 1):
             kmeans = KMeans(n_clusters=k, random_state=self.random_state, n_init=10)
             labels = kmeans.fit_predict(pca_data)
-            score = silhouette_score(pca_data, labels)
             
-            if score > best_score:
+            # Davies-Bouldin Index: ratio of within-cluster scatter to between-cluster separation
+            score = davies_bouldin_score(pca_data, labels) 
+            
+            if score < best_score:
                 best_score = score
                 best_k = k
                 
+        print(f"   -> Davies-Bouldin optimization selected k={best_k} (score={best_score:.4f})")
         return best_k
 
     def fit_predict(self, data_source) -> pd.DataFrame:
@@ -213,7 +236,7 @@ class AdvancedCustomerSegmentation:
         polars_features = self.generate_advanced_metrics(clean_lazy)
         print(f"   -> Generated 50+ features for {len(polars_features)} unique customers.")
         
-        print("3. Preprocessing Data (Scaling & PCA)...")
+        print("3. Preprocessing Data (Winsorization, RobustScaling & PCA)...")
         pandas_features = polars_features.to_pandas()
         pca_data = self._preprocess_data(pandas_features)
         
@@ -225,7 +248,14 @@ class AdvancedCustomerSegmentation:
         self.model = KMeans(n_clusters=self.optimal_k, random_state=self.random_state, n_init=10)
         
         pandas_features['Cluster'] = self.model.fit_predict(pca_data)
+        
+        # 6. Add PCA components to output for 3D visualization
+        pca_cols = [f'PC{i+1}' for i in range(self.n_components)]
+        pca_df = pd.DataFrame(pca_data, columns=pca_cols, index=pandas_features.index)
+        pandas_features = pd.concat([pandas_features, pca_df], axis=1)
+        
         return pandas_features
+
 
 # ==========================================
 # Example Usage
@@ -239,6 +269,6 @@ if __name__ == "__main__":
     # Run the full unified process
     segmented_customers_pd = pipeline.fit_predict(data_path)
     
-    # Save the richly featured segments
+    # Save the richly featured segments with PCA components
     segmented_customers_pd.to_parquet("customer_segments_advanced.parquet")
     print("\nSaved segments to customer_segments_advanced.parquet")
