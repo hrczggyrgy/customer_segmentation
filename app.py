@@ -27,16 +27,15 @@ if 'tx_fingerprint' not in st.session_state:
     st.session_state.tx_fingerprint = None
 if 'segments_fingerprint' not in st.session_state:
     st.session_state.segments_fingerprint = None
+if 'pca_metadata' not in st.session_state:
+    st.session_state.pca_metadata = None
 
 # ============================================================
 # HELPER FUNCTIONS
 # ============================================================
 def compute_fingerprint(df: pl.DataFrame) -> str:
     """Compute a stable fingerprint of the DataFrame for change detection.
-    Uses a hash of the underlying file for deterministic fingerprinting."""
-    # For Parquet files, we can't easily get the file path from a DataFrame
-    # Fall back to hashing a stable sample
-    # Sort by all columns for deterministic ordering
+    Sorts by all columns for deterministic fingerprinting."""
     df_sorted = df.sort(df.columns)
     n_rows = df_sorted.height
     schema_str = str(df_sorted.schema)
@@ -52,8 +51,7 @@ def compute_file_fingerprint(uploaded_file) -> str:
     return hashlib.sha256(content).hexdigest()[:16]
 
 def compute_local_file_fingerprint(path: str) -> str:
-    """Compute fingerprint of local Parquet file."""
-    import hashlib
+    """Compute fingerprint of local Parquet file using SHA256."""
     with open(path, 'rb') as f:
         content = f.read()
     return hashlib.sha256(content).hexdigest()[:16]
@@ -78,7 +76,6 @@ def load_transactions_from_file(uploaded_file) -> pl.DataFrame:
     """Load transactions from uploaded file or local fallback."""
     if uploaded_file is not None:
         return pl.read_parquet(io.BytesIO(uploaded_file.read()))
-    # Fallback to local file
     try:
         return pl.read_parquet("customer_transactions_clean.parquet")
     except FileNotFoundError:
@@ -86,27 +83,21 @@ def load_transactions_from_file(uploaded_file) -> pl.DataFrame:
         return None
 
 # ============================================================
-# SEGMENTATION PIPELINE (cached) - returns (segments_df, metadata_dict)
+# SEGMENTATION PIPELINE (cached)
 # ============================================================
 @st.cache_data(show_spinner=False)
 def run_segmentation_pipeline(transactions_df: pl.DataFrame, tx_fingerprint: str):
-    """Run the full segmentation pipeline on transaction data.
-    Returns (segments_df, metadata_dict)."""
+    """Run the full segmentation pipeline on transaction data."""
     pipeline = AdvancedCustomerSegmentation(max_clusters=8, n_components=6)
     segments = pipeline.fit_predict(transactions_df)
     metadata = pipeline.get_pca_metadata(tx_fingerprint)
     return segments, metadata
 
 def get_or_generate_segments(tx_df: pl.DataFrame, tx_fingerprint: str, force_refresh: bool = False):
-    """Load existing segments or generate new ones from transactions.
-    Segments are matched to source data via fingerprint.
-    force_refresh=True bypasses cached artifact."""
-    
-    # Check if we have a matching local segment artifact
+    """Load existing segments or generate new ones from transactions."""
     if not force_refresh:
         try:
             segments = pl.read_parquet("customer_segments_advanced.parquet")
-            # Check if fingerprint matches
             try:
                 with open("pca_metadata.json", 'r') as f:
                     metadata = json.load(f)
@@ -120,7 +111,6 @@ def get_or_generate_segments(tx_df: pl.DataFrame, tx_fingerprint: str, force_ref
         except FileNotFoundError:
             pass
     
-    # If no matching local file, or force_refresh, run pipeline on provided transactions
     if tx_df is not None:
         status_placeholder = st.sidebar.empty()
         try:
@@ -133,7 +123,6 @@ def get_or_generate_segments(tx_df: pl.DataFrame, tx_fingerprint: str, force_ref
                 
                 segments, metadata = run_segmentation_pipeline(tx_df, tx_fingerprint)
                 
-                # Save to local file for future runs
                 segments.write_parquet("customer_segments_advanced.parquet")
                 with open("pca_metadata.json", 'w') as f:
                     json.dump(metadata, f, indent=2)
@@ -149,12 +138,10 @@ def get_or_generate_segments(tx_df: pl.DataFrame, tx_fingerprint: str, force_ref
     st.stop()
 
 # ============================================================
-# RETENTION MATRIX (cached) - Fixed: Proper cohort maturity handling
+# RETENTION MATRIX (cached) - Fixed: Proper cohort maturity
 # ============================================================
 @st.cache_data
 def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFrame:
-    """Generates a Monthly Repeat-Purchase Retention matrix entirely in Polars.
-    Properly handles cohort maturity: immature periods = null, mature zero = 0%."""
     df = transactions_lf.with_columns([
         pl.col('transaction_date').dt.truncate('1mo').alias('OrderMonth'),
     ]).with_columns([
@@ -183,7 +170,6 @@ def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFr
         aggregate_function='first'
     ).sort('CohortMonth')
     
-    # DO NOT fill_null globally - preserves null for unobserved periods
     period_cols = [c for c in cohort_pivot.columns if c != 'CohortMonth' and isinstance(c, (int, str))]
     period_cols_int = []
     for c in period_cols:
@@ -195,7 +181,6 @@ def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFr
     if period_cols_int:
         period_cols_int.sort()
         
-        # Calculate dataset's final observed month for maturity
         max_order_month = df.select(pl.col('OrderMonth').max()).collect().item()
         
         if 0 in period_cols_int:
@@ -203,9 +188,6 @@ def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFr
             for pc in period_cols_int:
                 pc_str = str(pc)
                 if pc != 0:
-                    # Determine if period is mature for each cohort
-                    # A period is mature if CohortMonth + pc <= max_order_month
-                    # For each cohort row, check maturity
                     cohort_pivot = cohort_pivot.with_columns(
                         pl.when(
                             (pl.col("0") > 0) & 
@@ -220,7 +202,6 @@ def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFr
                         .otherwise(None)
                         .alias(pc_str)
                     )
-            # Month 0 is always 100% where cohort exists
             cohort_pivot = cohort_pivot.with_columns(
                 pl.when(pl.col("0") > 0).then(pl.lit(1.0)).otherwise(None).alias("0")
             )
@@ -229,21 +210,16 @@ def generate_retention_matrix_polars(transactions_lf: pl.LazyFrame) -> pl.DataFr
         pl.col('CohortMonth').dt.strftime('%Y-%m').alias('Cohort')
     ).drop('CohortMonth')
     
-    # Ensure period columns are sorted numerically
     new_cols = ['Cohort'] + [str(pc) for pc in period_cols_int]
     return cohort_pivot.select(new_cols)
 
 # ============================================================
 # MAIN DATA LOADING LOGIC
 # ============================================================
-
-# Load transactions (handle upload changes correctly)
 if uploaded_transactions is not None:
-    # New upload - compute fingerprint to detect actual changes
     new_fp = compute_file_fingerprint(uploaded_transactions)
     
     if st.session_state.tx_fingerprint != new_fp:
-        # Data actually changed - load new data and reset segments
         tx_df = pl.read_parquet(io.BytesIO(uploaded_transactions.read()))
         st.session_state.tx_df = tx_df
         st.session_state.tx_fingerprint = new_fp
@@ -252,10 +228,8 @@ if uploaded_transactions is not None:
         st.session_state.segments_fingerprint = None
         st.sidebar.info("🔄 New transaction data detected. Please regenerate segments.")
     else:
-        # Same data - use cached
         tx_df = st.session_state.tx_df
 else:
-    # No upload - try local file or session state
     if st.session_state.tx_df is not None:
         tx_df = st.session_state.tx_df
     else:
@@ -271,10 +245,11 @@ else:
 tx_lazy = tx_df.lazy()
 
 # ============================================================
-# SEGMENTATION TRIGGER
+# SEGMENTATION TRIGGER - Always visible
 # ============================================================
+st.sidebar.header("🔧 Segmentation Controls")
+
 if not st.session_state.segments_generated or st.session_state.segments_df is None:
-    # Show generate button
     col1, col2 = st.sidebar.columns([3, 1])
     with col1:
         if st.button("🔄 Generate / Refresh Segments", type="primary", use_container_width=True):
@@ -282,19 +257,43 @@ if not st.session_state.segments_generated or st.session_state.segments_df is No
                 segments_df, metadata = get_or_generate_segments(tx_df, st.session_state.tx_fingerprint, force_refresh=True)
                 st.session_state.segments_df = segments_df
                 st.session_state.segments_fingerprint = st.session_state.tx_fingerprint
+                st.session_state.pca_metadata = metadata
                 st.session_state.segments_generated = True
             st.rerun()
     with col2:
-        if st.button("⚡ Force", help="Force regenerate even if segments exist"):
+        if st.button("⚡ Force Regenerate", help="Force regenerate even if segments exist and match", use_container_width=True):
             with st.spinner("Force regenerating..."):
                 segments_df, metadata = get_or_generate_segments(tx_df, st.session_state.tx_fingerprint, force_refresh=True)
                 st.session_state.segments_df = segments_df
                 st.session_state.segments_fingerprint = st.session_state.tx_fingerprint
+                st.session_state.pca_metadata = metadata
                 st.session_state.segments_generated = True
             st.rerun()
-    st.info("👈 Click **'Generate / Refresh Segments'** in the sidebar to run the segmentation pipeline.")
+    st.info("👈 Click **'Generate / Refresh Segments'** to run the segmentation pipeline.")
     st.stop()
 else:
+    # Always show controls for existing segments
+    col1, col2 = st.sidebar.columns([3, 1])
+    with col1:
+        if st.button("🔄 Refresh Segments", type="secondary", use_container_width=True):
+            with st.spinner("Running segmentation..."):
+                segments_df, metadata = get_or_generate_segments(tx_df, st.session_state.tx_fingerprint, force_refresh=False)
+                st.session_state.segments_df = segments_df
+                st.session_state.segments_fingerprint = st.session_state.tx_fingerprint
+                st.session_state.pca_metadata = metadata
+                st.session_state.segments_generated = True
+            st.rerun()
+    with col2:
+        if st.button("⚡ Force Regenerate", help="Force regenerate bypassing local artifact cache", use_container_width=True):
+            with st.spinner("Force regenerating..."):
+                # Clear cache by using a different fingerprint
+                get_or_generate_segments.clear()
+                segments_df, metadata = get_or_generate_segments(tx_df, st.session_state.tx_fingerprint, force_refresh=True)
+                st.session_state.segments_df = segments_df
+                st.session_state.segments_fingerprint = st.session_state.tx_fingerprint
+                st.session_state.pca_metadata = metadata
+                st.session_state.segments_generated = True
+            st.rerun()
     segments_df = st.session_state.segments_df
 
 # Verify segments match current data
@@ -402,7 +401,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 ])
 
 # ------------------------------------------------------------------
-# TAB 1: RISK–VALUE PORTFOLIO (Fixed: aligned spend threshold)
+# TAB 1: RISK–VALUE PORTFOLIO (Fixed: filters applied consistently)
 # ------------------------------------------------------------------
 with tab1:
     st.header("Risk–Value Portfolio")
@@ -458,7 +457,7 @@ with tab1:
     fig_scatter.add_vline(x=3.0, line_dash="dash", line_color="red", 
                           annotation_text="Critical Delay", annotation_position="top right")
     
-    # Horizontal spend threshold (percentile-based) - calculated on FULL dataset
+    # Horizontal spend threshold - calculated on FULL dataset
     spend_threshold = full_plot_df['Total_Lifetime_Spend'].quantile(spend_pct / 100)
     fig_scatter.add_hline(y=spend_threshold, line_dash="dot", line_color="green",
                           annotation_text=f"High Value ({spend_pct}th pctl: ${spend_threshold:,.0f})", 
@@ -481,15 +480,18 @@ with tab1:
                               text="Low Value + Overdue", showarrow=False,
                               font=dict(size=10, color="orange"), bgcolor="rgba(255,255,255,0.8)")
     
-    if show_no_history and not no_history.empty:
+    # Filter no_history by selected clusters
+    no_history_filtered = no_history[no_history['Cluster'].isin(selected_clusters)]
+    
+    if show_no_history and not no_history_filtered.empty:
         fig_scatter.add_scatter(
-            x=no_history['Churn_Risk_Index_CRI'],
-            y=no_history['Total_Lifetime_Spend'],
+            x=no_history_filtered['Churn_Risk_Index_CRI'],
+            y=no_history_filtered['Total_Lifetime_Spend'],
             mode='markers',
             marker=dict(symbol='x', size=8, color='lightgray'),
             name='Insufficient history',
             showlegend=True,
-            hovertext=no_history['customer_id'].astype(str) + ': $' + no_history['Total_Lifetime_Spend'].astype(str)
+            hovertext=no_history_filtered['customer_id'].astype(str) + ': $' + no_history_filtered['Total_Lifetime_Spend'].astype(str)
         )
     
     fig_scatter.update_layout(
@@ -501,20 +503,21 @@ with tab1:
     st.plotly_chart(fig_scatter, use_container_width=True)
     
     st.subheader("Top Targets: High Value + High Delay")
-    # Use SAME threshold as chart
+    # Use SAME threshold as chart, filtered by selected clusters
     high_delay = full_plot_df[
         (full_plot_df['Churn_Risk_Index_CRI'] >= 2.0) & 
-        (full_plot_df['Total_Lifetime_Spend'] >= spend_threshold)
+        (full_plot_df['Total_Lifetime_Spend'] >= spend_threshold) &
+        (full_plot_df['Cluster'].isin(selected_clusters))
     ].nlargest(20, 'Total_Lifetime_Spend')
     
     if not high_delay.empty:
         st.dataframe(high_delay[['customer_id', 'Segment', 'Total_Lifetime_Spend', 
                                   'Churn_Risk_Index_CRI', 'Recency_Days', 'Average_Order_Value_AOV']])
     else:
-        st.info("No customers meeting both high-value and high-delay criteria.")
+        st.info("No customers meeting both high-value and high-delay criteria in selected clusters.")
 
 # ------------------------------------------------------------------
-# TAB 2: SEGMENT PROFILES (Fixed: Correct hover z-scores)
+# TAB 2: SEGMENT PROFILES (Fixed: Correct hover from segment_means)
 # ------------------------------------------------------------------
 with tab2:
     st.header("Segment Profiles")
@@ -558,22 +561,19 @@ with tab2:
             else:
                 z_data[m] = 0
         
-        # Prepare customdata for hover - ONE value per cell: [raw_mean, overall_mean, z_score]
+        # Prepare customdata for hover - iterate over segment_means (raw values)
         hover_data = []
-        for _, row in z_data.iterrows():
+        for _, row in segment_means.iterrows():
             cell_data = []
             for i, m in enumerate(available_metrics):
-                raw = row[m]
+                raw = row[m]  # Use raw segment mean
                 overall = overall_means[m]
                 std_val = overall_stds[m]
                 z_score = (raw - overall) / std_val if std_val > 0 else 0
                 cell_data.append([raw, overall, z_score])
             hover_data.append(cell_data)
         
-        # hover_data is now list of lists: each cell has [raw, overall, z]
-        # Convert to numpy array with shape (n_segments, n_metrics, 3)
         hover_array = np.array(hover_data)
-        
         z_values = z_data[available_metrics].values
         
         fig_heatmap = px.imshow(
@@ -585,10 +585,7 @@ with tab2:
             text_auto=".2f",
             aspect="auto",
             title="Standardized Segment Differences from Customer Base",
-            # Set symmetric color range for consistency across selections
-            color_continuous_scale='RdBu_r',
         )
-        # Add custom hover with raw values
         fig_heatmap.update_traces(
             customdata=hover_array,
             hovertemplate=(
@@ -605,7 +602,6 @@ with tab2:
             yaxis_title="",
             height=400 + len(z_data) * 30,
             coloraxis_colorbar=dict(title="Std. Diff. from Overall"),
-            # Ensure symmetric color range
             coloraxis_cmin=-3,
             coloraxis_cmax=3,
         )
@@ -711,7 +707,7 @@ with tab3:
         st.warning("No distribution metrics available.")
 
 # ------------------------------------------------------------------
-# TAB 4: MODEL EXPLORATION (Fixed: Actual PCA metadata)
+# TAB 4: MODEL EXPLORATION (PCA metadata from session state)
 # ------------------------------------------------------------------
 with tab4:
     st.header("Model Exploration: PCA Projection")
@@ -776,56 +772,73 @@ with tab4:
         st.plotly_chart(fig_pca, use_container_width=True)
         
         if show_explained:
-            # Try to load actual PCA metadata
-            try:
-                with open("pca_metadata.json", 'r') as f:
-                    metadata = json.load(f)
-                
-                evr = metadata.get('explained_variance_ratio', [])
-                evc = metadata.get('explained_variance_cumulative', [])
-                
-                if evr:
-                    # Plot explained variance
-                    fig_ev = go.Figure()
-                    fig_ev.add_trace(go.Bar(
-                        x=[f'PC{i+1}' for i in range(len(evr))],
-                        y=[v * 100 for v in evr],
-                        name='Individual',
-                        marker_color='steelblue',
-                        text=[f'{v*100:.1f}%' for v in evr],
-                        textposition='outside',
-                    ))
-                    fig_ev.add_trace(go.Scatter(
-                        x=[f'PC{i+1}' for i in range(len(evc))],
-                        y=[v * 100 for v in evc],
-                        name='Cumulative',
-                        mode='lines+markers+text',
-                        line=dict(color='red', width=3),
-                        text=[f'{v*100:.1f}%' for v in evc],
-                        textposition='top center',
-                        yaxis='y2'
-                    ))
-                    fig_ev.update_layout(
-                        title="PCA Explained Variance",
-                        xaxis_title="Principal Component",
-                        yaxis=dict(title="Individual Variance (%)", side='left'),
-                        yaxis2=dict(title="Cumulative Variance (%)", side='right', overlaying='y', range=[0, 100]),
-                        height=400,
-                        legend=dict(x=0.02, y=0.98)
-                    )
-                    st.plotly_chart(fig_ev, use_container_width=True)
-                    
-                    st.caption(f"""
-                    **Total explained variance (6 components): {evc[-1]*100:.1f}%**
-                    - PC1: {evr[0]*100:.1f}% (Spend & Volume)
-                    - PC2: {evr[1]*100:.1f}% (Cadence & Frequency)
-                    - PC3: {evr[2]*100:.1f}% (Category Depth)
-                    - PC4: {evr[3]*100:.1f}% (Basket Variance)
-                    - PC5: {evr[4]*100:.1f}% (Discount Affinity)
-                    - PC6: {evr[5]*100:.1f}% (Price Variability)
-                    """)
+            # Use metadata from session state (verified against fingerprint)
+            metadata = st.session_state.pca_metadata
+            if metadata is None:
+                # Fallback to file
+                try:
+                    with open("pca_metadata.json", 'r') as f:
+                        metadata = json.load(f)
+                except (FileNotFoundError, json.JSONDecodeError):
+                    metadata = None
+            
+            if metadata:
+                # Verify fingerprint matches current session
+                if metadata.get('source_fingerprint') != st.session_state.tx_fingerprint:
+                    st.warning("⚠️ PCA metadata fingerprint doesn't match current data. Run segmentation to update.")
                 else:
-                    st.info("PCA metadata not available. Run segmentation to generate.")
+                    evr = metadata.get('explained_variance_ratio', [])
+                    evc = metadata.get('explained_variance_cumulative', [])
+                    loadings = metadata.get('loadings', [])
+                    feature_names = metadata.get('feature_names', [])
+                    
+                    if evr:
+                        # Plot explained variance
+                        fig_ev = go.Figure()
+                        fig_ev.add_trace(go.Bar(
+                            x=[f'PC{i+1}' for i in range(len(evr))],
+                            y=[v * 100 for v in evr],
+                            name='Individual',
+                            marker_color='steelblue',
+                            text=[f'{v*100:.1f}%' for v in evr],
+                            textposition='outside',
+                        ))
+                        fig_ev.add_trace(go.Scatter(
+                            x=[f'PC{i+1}' for i in range(len(evc))],
+                            y=[v * 100 for v in evc],
+                            name='Cumulative',
+                            mode='lines+markers+text',
+                            line=dict(color='red', width=3),
+                            text=[f'{v*100:.1f}%' for v in evc],
+                            textposition='top center',
+                            yaxis='y2'
+                        ))
+                        fig_ev.update_layout(
+                            title="PCA Explained Variance (from session metadata)",
+                            xaxis_title="Principal Component",
+                            yaxis=dict(title="Individual Variance (%)", side='left'),
+                            yaxis2=dict(title="Cumulative Variance (%)", side='right', overlaying='y', range=[0, 100]),
+                            height=400,
+                            legend=dict(x=0.02, y=0.98)
+                        )
+                        st.plotly_chart(fig_ev, use_container_width=True)
+                        
+                        # Show loadings for interpretation
+                        if loadings and feature_names:
+                            st.subheader("Component Loadings (Top 5 features per PC)")
+                            loadings_df = pd.DataFrame(loadings, columns=[f'PC{i+1}' for i in range(len(loadings[0]))])
+                            loadings_df.index = feature_names
+                            loadings_df = loadings_df.T
+                            
+                            for i in range(len(loadings_df)):
+                                top_features = loadings_df.iloc[i].abs().nlargest(5)
+                                st.write(f"**PC{i+1}** ({evr[i]*100:.1f}%): " + ", ".join([f"{feat} ({val:.3f})" for feat, val in top_features.items()]))
+                        
+                        st.caption(f"""
+                        **Total explained variance (6 components): {evc[-1]*100:.1f}%**
+                        """)
+                    else:
+                        st.info("PCA metadata not available. Run segmentation to generate.")
             except (FileNotFoundError, json.JSONDecodeError):
                 st.info("PCA metadata not found. Run segmentation to generate pca_metadata.json.")
     else:
@@ -885,7 +898,6 @@ with tab5:
                     col1, col2, col3 = st.columns(3)
                     with col1:
                         if '1' in period_cols:
-                            # Only include non-null (mature) values in average
                             m1 = retention_df.select(pl.col('1').drop_nulls().mean()).item()
                             st.metric("Avg Month 1 Retention (mature)", f"{m1:.1%}")
                     with col2:
@@ -898,12 +910,11 @@ with tab5:
                     st.warning("Insufficient transaction history for cohort analysis.")
 
 # ------------------------------------------------------------------
-# SIDEBAR: Segment Summary (Fixed: iterate selected_clusters, use full segments_df)
+# SIDEBAR: Segment Summary (iterate selected_clusters)
 # ------------------------------------------------------------------
 st.sidebar.markdown("---")
 st.sidebar.header("Segment Summary")
 
-# Use selected_clusters for iteration, compute from segments_df (full) for stable metrics
 for c in selected_clusters:
     subset = segments_df.filter(pl.col('Cluster') == c)
     if subset.is_empty():
