@@ -390,9 +390,15 @@ elif st.session_state.tx_df is None:
     try:
         raw_df = pl.read_parquet(demo_path)
         
+        # Debug: show original columns
+        st.sidebar.caption(f"Original columns: {raw_df.columns}")
+        
         # Apply column mapping for demo files (same as upload)
         suggested_mapping = suggest_column_mapping(raw_df.columns)
+        st.sidebar.caption(f"Suggested mapping: {suggested_mapping}")
+        
         mapped_df = apply_column_mapping(raw_df, suggested_mapping)
+        st.sidebar.caption(f"Mapped columns: {mapped_df.columns}")
         
         new_tx_df, dropped_rows = validate_transactions(mapped_df)
         st.session_state.tx_df = new_tx_df
