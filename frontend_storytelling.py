@@ -169,36 +169,99 @@ def render_contribution(profiles, selected, colors):
     import plotly.express as px
     import streamlit as st
     visible = profiles.loc[profiles.index.isin(selected)]
-    order = visible['label'].tolist()
+    
+    # Create short labels for charts: "C2 · High-spend, overdue"
+    def short_label(full_label: str) -> str:
+        # "Cluster 2 · high-spend overdue repeat buyers" -> "C2 · High-spend, overdue"
+        parts = full_label.split(' · ')
+        if len(parts) != 2:
+            return full_label
+        cluster_part = parts[0].replace('Cluster ', 'C')
+        desc = parts[1]
+        # Simplify description
+        desc = desc.replace('repeat buyers', '').replace('repeat history', 'history')
+        desc = desc.replace('high-spend', 'High-spend').replace('mid-spend', 'Mid-spend').replace('low-spend', 'Low-spend')
+        desc = desc.replace('on-cadence', 'on-cadence').replace('overdue', 'overdue').replace('delayed', 'delayed').replace('limited', 'limited')
+        desc = desc.strip()
+        return f"{cluster_part} · {desc}"
+    
+    visible = visible.copy()
+    visible['short_label'] = visible['label'].apply(short_label)
+    order = visible['short_label'].tolist()
+    label_to_full = dict(zip(visible['short_label'], visible['label']))
+    
     st.subheader('Which segments contribute most?')
-    for column, metric, title in zip(st.columns(2), ['customer_share', 'spend_share'], ['Customer share', 'Observed-spend share']):
-        fig = px.bar(visible, x=metric, y='label', color='label', orientation='h',
-            color_discrete_map=colors, category_orders={'label': order}, text_auto='.1f',
-            hover_data={'customers': True, 'spend': ':,.0f', 'label': False},
-            labels={metric: '% of full base', 'label': ''}, title=title)
-        fig.update_traces(texttemplate='%{x:.1f}%')
-        fig.update_layout(showlegend=False, height=max(300, len(order) * 45), margin=dict(t=50, b=30))
-        fig.update_xaxes(range=[0, 105])
-        with column:
-            st.plotly_chart(fig, use_container_width=True)
+    
+    # Headline: leading segment punchline
     leader = visible.sort_values('spend_share', ascending=False).iloc[0]
     ratio, gap = contribution_metrics(leader['customer_share'], leader['spend_share'], profiles['spend'].sum())
-    if ratio is None:
-        st.info('Observed-spend contribution is unavailable: a positive base spend and customer share are required.')
-    else:
-        st.info(f"{leader['label']} represents {leader['customer_share']:.1f}% of customers and {leader['spend_share']:.1f}% of observed spend.")
+    if ratio is not None and gap is not None:
+        headline = f"{label_to_full[leader['short_label']].split(' · ')[0]} is {leader['customer_share']:.1f}% of customers but {leader['spend_share']:.1f}% of spend (gap: {gap:+.1f} pp, index: {ratio:.2f}×)"
+        st.info(headline)
+    
+    # Single grouped horizontal bar chart
+    share_plot = visible[['short_label', 'customer_share', 'spend_share']].melt(
+        id_vars='short_label',
+        var_name='Share type',
+        value_name='Share (%)'
+    )
+    share_plot['Share type'] = share_plot['Share type'].map({
+        'customer_share': 'Customer share',
+        'spend_share': 'Observed-spend share',
+    })
+    
+    fig = px.bar(
+        share_plot,
+        x='Share (%)',
+        y='short_label',
+        color='Share type',
+        orientation='h',
+        barmode='group',
+        text_auto='.1f',
+        labels={'short_label': 'Segment', 'Share (%)': '% of full base'},
+        category_orders={'short_label': order, 'Share type': ['Customer share', 'Observed-spend share']},
+        color_discrete_map={
+            'Customer share': '#636EFA',
+            'Observed-spend share': '#EF553B',
+        },
+        custom_data=[share_plot['short_label'].map(visible.set_index('short_label')['customers'])],
+    )
+    fig.update_traces(
+        texttemplate='%{x:.1f}%',
+        hovertemplate='Segment: %{y}<br>Share type: %{fullData.name}<br>Share: %{x:.1f}%<br>Customers: %{customdata[0]:,}<extra></extra>',
+    )
+    fig.update_layout(
+        barmode='group',
+        height=max(300, len(order) * 45),
+        margin=dict(t=30, b=30),
+        showlegend=True,
+        legend_title_text='',
+        yaxis=dict(automargin=True),
+    )
+    fig.update_xaxes(range=[0, 105])
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # KPI cards
     ratio_col, gap_col = st.columns(2)
     ratio_col.metric('Spend contribution index', f'{ratio:.2f}×' if ratio is not None else 'N/A')
     gap_col.metric('Gap vs. customer share', f'{gap:+.1f} pp' if gap is not None else 'N/A')
-    st.caption('Leading segment = highest observed-spend share among selected segments. Denominators use the full base. Index = spend share / customer share; gap = spend share − customer share in percentage points, not change over time. Observed spend is historical, not predicted lifetime value. Undefined spend-share bars display zero.')
+    st.caption('Leading segment = highest observed-spend share among selected segments. Denominators use the full base. Index = spend share / customer share; gap = spend share − customer share in percentage points, not change over time. Observed spend is historical, not predicted lifetime value.')
 
 
 def _card():
     import streamlit as st
-    try:
-        return st.container(border=True)
-    except TypeError:
-        return st.container()
+    # Fallback for older Streamlit versions without st.container
+    if hasattr(st, 'container'):
+        try:
+            return st.container(border=True)
+        except TypeError:
+            return st.container()
+    # Fallback: just return a context manager that does nothing
+    from contextlib import contextmanager
+    @contextmanager
+    def dummy_container():
+        yield None
+    return dummy_container()
 
 
 def render_profiles(customers, profiles, selected):
@@ -245,6 +308,7 @@ def render_risk(customers, selected, colors, order, source_fingerprint):
     import hashlib
     import inspect
     import plotly.express as px
+    import plotly.graph_objects as go
     import streamlit as st
     st.header('Risk–value portfolio')
     st.caption('Purchase delay = recency / average purchase interval. Select points to inspect customers; it is not a calibrated churn probability.')
@@ -266,16 +330,45 @@ def render_risk(customers, selected, colors, order, source_fingerprint):
             st.caption(f'{omitted:,} non-positive-spend customers omitted from the log chart, not from summaries.')
     ids = set()
     if not plot.empty:
+        # WebGL rendering for responsiveness
         fig = px.scatter(plot, x='Churn_Risk_Index_CRI', y='Total_Lifetime_Spend', color='Segment', symbol='History',
             symbol_map={'Repeat history': 'circle', 'Insufficient history': 'x'}, color_discrete_map=colors,
             category_orders={'Segment': order}, custom_data=['customer_id'], hover_name='customer_id',
             hover_data={'Recency_Days': True, 'Average_Order_Value_AOV': ':,.2f', 'Average_InterPurchase_Time_AIPT': ':.1f', 'Total_Lifetime_Spend': ':,.2f'},
-            labels={'Churn_Risk_Index_CRI': 'Purchase delay', 'Total_Lifetime_Spend': 'Observed spend ($)'}, log_y=log, opacity=.65)
+            labels={'Churn_Risk_Index_CRI': 'Purchase delay', 'Total_Lifetime_Spend': 'Observed spend ($)'}, log_y=log, opacity=.65,
+            render_mode='webgl')
         for x, title in [(1, 'On cadence'), (2, '2× cadence'), (3, '3× cadence')]:
             fig.add_vline(x=x, line_dash='dot', annotation_text=title)
         if np.isfinite(threshold) and (not log or threshold > 0):
             fig.add_hline(y=threshold, line_dash='dot', annotation_text=f'Full-base repeat-buyer P{percentile}: ${threshold:,.0f}')
-        fig.update_layout(height=550, dragmode='lasso')
+        
+        # Priority zone: high spend + delay >= 2
+        if np.isfinite(threshold):
+            x_max = plot['Churn_Risk_Index_CRI'].max() if not plot.empty else 5
+            x_max = max(x_max, 3)
+            y_max = plot['Total_Lifetime_Spend'].max() if not plot.empty else threshold * 10
+            if log:
+                y_max = y_max if np.isfinite(y_max) and y_max > threshold else threshold * 10
+            
+            fig.add_shape(
+                type='rect',
+                x0=2, x1=x_max, y0=threshold, y1=y_max,
+                fillcolor='rgba(239, 85, 59, 0.08)',
+                line=dict(width=1, color='#EF553B', dash='dash'),
+                layer='below',
+            )
+            fig.add_annotation(
+                x=2.1, y=threshold * (1.2 if not log else 1.5),
+                text='Priority outreach zone',
+                showarrow=False,
+                font=dict(size=11, color='#EF553B'),
+                xanchor='left', yanchor='bottom',
+                bgcolor='rgba(255,255,255,0.9)',
+                bordercolor='#EF553B',
+                borderwidth=1,
+            )
+        
+        fig.update_layout(height=550, dragmode='lasso', yaxis=dict(automargin=True))
         signature = f'{source_fingerprint}|{selected}|{percentile}|{log}|{show_history}'
         key = 'risk_' + hashlib.sha256(signature.encode()).hexdigest()[:12]
         if 'on_select' in inspect.signature(st.plotly_chart).parameters:
@@ -304,19 +397,70 @@ def render_risk(customers, selected, colors, order, source_fingerprint):
             'Average_Order_Value_AOV': st.column_config.NumberColumn('AOV', format='$%.2f'),
             'Churn_Risk_Index_CRI': st.column_config.NumberColumn('Purchase delay', format='%.2f'),
         })
+        # Download button
+        csv = targets[columns].to_csv(index=False).encode('utf-8')
+        st.download_button(
+            'Download targets (CSV)',
+            data=csv,
+            file_name='risk_value_targets.csv',
+            mime='text/csv',
+        )
+
+
+def render_zscore_small_multiples(customers, profiles, selected, colors, order):
+    """Show standardized differences (z-scores) as small-multiple horizontal bar charts.
+
+    Each facet is one segment; x-axis is z-score with zero line.
+    This is stable across selections because it uses full-base standardization.
+    """
+    import plotly.express as px
+    import streamlit as st
+    visible = profiles.loc[profiles.index.isin(selected)]
+    if visible.empty:
+        return
+    metrics, z, _ = profile_matrix(customers, visible.index.tolist())
+    z.index = visible.loc[z.index, 'label'].values
+    
+    # Melt for faceting
+    z_long = z.reset_index().melt(id_vars='index', var_name='metric', value_name='z')
+    z_long = z_long.rename(columns={'index': 'Segment'})
+    z_long['metric_label'] = z_long['metric'].map(METRICS)
+    
+    # Create short labels for facets
+    def short_label(full_label: str) -> str:
+        parts = full_label.split(' · ')
+        if len(parts) != 2:
+            return full_label
+        cluster_part = parts[0].replace('Cluster ', 'C')
+        desc = parts[1].replace('repeat buyers', '').replace('repeat history', 'history')
+        desc = desc.replace('high-spend', 'High-spend').replace('mid-spend', 'Mid-spend').replace('low-spend', 'Low-spend')
+        desc = desc.strip()
+        return f"{cluster_part} · {desc}"
+    
+    z_long['Segment'] = z_long['Segment'].apply(short_label)
+    
+    st.subheader('Segment profiles (standardized differences)')
+    st.caption('Each chart shows how a segment differs from the full-base mean in standard deviations. Red = above average (not necessarily better).')
+    
+    fig = px.bar(
+        z_long,
+        x='z', y='metric_label', color='Segment',
+        facet_col='Segment', facet_col_wrap=3,
+        color_discrete_map={short_label(label): colors[label] for label in order},
+        labels={'z': 'Standardized difference (z)', 'metric_label': ''},
+        height=max(400, len(metrics) * 35 + 100),
+    )
+    # Add zero line to each facet
+    fig.add_vline(x=0, line_color='#64748B', line_width=1, line_dash='solid')
+    fig.update_yaxes(autorange='reversed', automargin=True)
+    fig.update_xaxes(range=[-3.5, 3.5], dtick=1)
+    # Clean facet titles
+    fig.for_each_annotation(lambda a: a.update(text=a.text.split('=')[-1]))
+    fig.update_layout(showlegend=False, margin=dict(l=10, r=10, t=60, b=40))
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def render_radar(customers, selected, colors, order):
-    import plotly.graph_objects as go
-    import streamlit as st
-    metrics = [m for m in METRICS if m in customers.columns]
-    means = customers[customers['Cluster'].isin(selected)].groupby('Segment')[metrics].mean().reindex(order)
-    normalized = ((means - means.min()) / (means.max() - means.min()).replace(0, np.nan)).fillna(.5)
-    with st.expander('Radar view: normalized within selection'):
-        st.caption('Shape depends on the selection; use the heatmap for stable full-base comparison.')
-        fig = go.Figure()
-        for label, row in normalized.iterrows():
-            values, names = row.tolist(), [METRICS[m] for m in metrics]
-            fig.add_trace(go.Scatterpolar(r=values + values[:1], theta=names + names[:1], fill='toself', name=label, line_color=colors[label]))
-        fig.update_layout(height=450, polar_radialaxis=dict(range=[0, 1]))
-        st.plotly_chart(fig, use_container_width=True)
+    """Deprecated: kept for backward compatibility. Use render_zscore_small_multiples instead."""
+    # Radar chart removed; small multiples are more honest (stable z-scores vs. selection-dependent min-max)
+    pass

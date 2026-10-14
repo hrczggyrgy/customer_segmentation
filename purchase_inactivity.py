@@ -445,4 +445,8 @@ def fit_evaluate_and_score(
         "predictions": predictions,
         "data_complete_through": complete_through,
         "feature_columns": FEATURE_COLUMNS.copy(),
+        # Holdout data for curves
+        "holdout_y_true": y_test,
+        "holdout_y_prob": test_probabilities,
+        "holdout_test_rows": test_rows[["snapshot_date", "customer_id", TARGET_COLUMN]].copy(),
     }

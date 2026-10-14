@@ -3,6 +3,7 @@ import polars as pl
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import plotly.io as pio
 import numpy as np
 import io
 import hashlib
@@ -11,7 +12,7 @@ from segmentation import AdvancedCustomerSegmentation
 from data_safety import source_fingerprint, generate_session_segments, finalized_month_end, month_end, retention_matrix
 from frontend_storytelling import (
     METRICS, prepare_customers, segment_profiles, render_contribution,
-    render_profiles, render_risk, render_radar,
+    render_profiles, render_risk, render_zscore_small_multiples,
 )
 from purchase_inactivity import (
     FEATURE_COLUMNS as INACTIVITY_FEATURE_COLUMNS,
@@ -21,6 +22,33 @@ from purchase_inactivity import (
     global_feature_effects,
     prepare_transactions as prepare_inactivity_transactions,
 )
+
+# ---- Plotly brand template ----
+BRAND_TEMPLATE = go.layout.Template(
+    layout=go.Layout(
+        font=dict(family="Inter, system-ui, sans-serif", size=12, color="#1E293B"),
+        title=dict(font=dict(size=16, color="#1E293B"), x=0.02, xanchor="left"),
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#FFFFFF",
+        colorway=["#2563EB", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A", "#19D3F3", "#FF6692", "#B6E880"],
+        xaxis=dict(
+            gridcolor="#E2E8F0", zerolinecolor="#E2E8F0", showgrid=True, zeroline=True,
+            title=dict(font=dict(size=12)), tickfont=dict(size=11)
+        ),
+        yaxis=dict(
+            gridcolor="#E2E8F0", zerolinecolor="#E2E8F0", showgrid=True, zeroline=True,
+            title=dict(font=dict(size=12)), tickfont=dict(size=11), automargin=True
+        ),
+        legend=dict(
+            bgcolor="rgba(255,255,255,0.8)", bordercolor="#E2E8F0", borderwidth=1,
+            font=dict(size=11), yanchor="top", y=1.0, xanchor="left", x=1.02
+        ),
+        margin=dict(l=60, r=120, t=50, b=40),
+        hoverlabel=dict(bgcolor="#FFFFFF", bordercolor="#E2E8F0", font=dict(size=11)),
+    )
+)
+pio.templates["brand"] = BRAND_TEMPLATE
+pio.templates.default = "brand"
 
 st.set_page_config(page_title="Advanced Customer Analytics", layout="wide")
 st.title("Customer Intelligence Platform")
@@ -189,7 +217,7 @@ with tab1:
     render_risk(customers, selected, colors, order, st.session_state.tx_fingerprint)
 with tab2:
     render_profiles(customers, profiles, selected)
-    render_radar(customers, selected, colors, order)
+    render_zscore_small_multiples(customers, profiles, selected, colors, order)
 with tab3:
     st.header('Distributions within segments')
     st.caption('Segment averages hide variation. Compare distributions before interpreting a persona.')
@@ -369,12 +397,9 @@ with tab6:
         st.warning('Confirm data completeness above to enable training and scoring.')
         st.stop()
 
-    # Fingerprint only once per session (uses cached Polars DF bytes)
+    # Fingerprint only once per session (reuse the transaction fingerprint from session)
     if 'inactivity_file_fingerprint' not in st.session_state:
-        import io
-        buf = io.BytesIO()
-        tx_df.write_parquet(buf)
-        st.session_state['inactivity_file_fingerprint'] = hashlib.sha256(buf.getvalue()).hexdigest()
+        st.session_state['inactivity_file_fingerprint'] = st.session_state.tx_fingerprint
     file_fingerprint = st.session_state['inactivity_file_fingerprint']
     run_key = (file_fingerprint, coverage_date.isoformat())
 
@@ -434,6 +459,57 @@ with tab6:
     if not evaluation['holdout_has_both_classes']:
         st.warning('The time-based holdout contains only one target class, so ROC-AUC and average precision cannot be reported reliably for this split.')
 
+    # Model evaluation curves
+    if evaluation['holdout_has_both_classes'] and 'holdout_y_true' in result and 'holdout_y_prob' in result:
+        y_true = result['holdout_y_true']
+        y_prob = result['holdout_y_prob']
+        
+        st.subheader('Model evaluation curves')
+        from sklearn.metrics import roc_curve, precision_recall_curve
+        from sklearn.calibration import calibration_curve
+        
+        curve_col1, curve_col2, curve_col3 = st.columns(3)
+        
+        # ROC Curve
+        fpr, tpr, _ = roc_curve(y_true, y_prob)
+        roc_fig = go.Figure()
+        roc_fig.add_trace(go.Scatter(x=fpr, y=tpr, mode='lines', name=f'ROC (AUC={evaluation["roc_auc"]:.3f})', line=dict(color='#2563EB', width=2)))
+        roc_fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode='lines', name='Random', line=dict(color='#94A3B8', width=1, dash='dash')))
+        roc_fig.update_layout(
+            title='ROC Curve', xaxis_title='False Positive Rate', yaxis_title='True Positive Rate',
+            height=300, legend=dict(yanchor='bottom', y=0.01, xanchor='right', x=0.99),
+            margin=dict(l=40, r=20, t=40, b=40)
+        )
+        curve_col1.plotly_chart(roc_fig, use_container_width=True)
+        
+        # Precision-Recall Curve
+        precision, recall, _ = precision_recall_curve(y_true, y_prob)
+        pr_fig = go.Figure()
+        pr_fig.add_trace(go.Scatter(x=recall, y=precision, mode='lines', name=f'PR (AP={evaluation["average_precision"]:.3f})', line=dict(color='#EF553B', width=2)))
+        # Baseline (prevalence)
+        baseline = y_true.mean()
+        pr_fig.add_hline(y=baseline, line_dash='dash', line_color='#94A3B8', annotation_text=f'Baseline ({baseline:.1%})', annotation_position='bottom right')
+        pr_fig.update_layout(
+            title='Precision-Recall Curve', xaxis_title='Recall', yaxis_title='Precision',
+            height=300, legend=dict(yanchor='bottom', y=0.01, xanchor='right', x=0.99),
+            margin=dict(l=40, r=20, t=40, b=40), yaxis_range=[0, 1.05]
+        )
+        curve_col2.plotly_chart(pr_fig, use_container_width=True)
+        
+        # Calibration (Reliability) Plot
+        prob_true, prob_pred = calibration_curve(y_true, y_prob, n_bins=10, strategy='quantile')
+        cal_fig = go.Figure()
+        cal_fig.add_trace(go.Scatter(x=prob_pred, y=prob_true, mode='lines+markers', name='Model', line=dict(color='#00CC96', width=2), marker=dict(size=6)))
+        cal_fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode='lines', name='Perfectly calibrated', line=dict(color='#94A3B8', width=1, dash='dash')))
+        cal_fig.update_layout(
+            title='Calibration Plot', xaxis_title='Mean predicted probability', yaxis_title='Fraction of positives',
+            height=300, legend=dict(yanchor='bottom', y=0.01, xanchor='right', x=0.99),
+            margin=dict(l=40, r=20, t=40, b=40)
+        )
+        curve_col3.plotly_chart(cal_fig, use_container_width=True)
+        
+        st.caption('Calibration shows whether predicted probabilities match observed frequencies. A well-calibrated model falls on the diagonal. Brier score alone does not establish calibration.')
+
     predictions = result['predictions']
     current_features = result['current_features']
     st.subheader('Currently active customers ranked by inactivity score')
@@ -451,14 +527,29 @@ with tab6:
     with active_col:
         st.metric('Mean estimated no-purchase probability', f'{predictions["no_purchase_probability"].mean():.1%}')
 
+    # Score histogram with risk bands
+    predictions = predictions.copy()
+    predictions['Risk band'] = pd.cut(
+        predictions['no_purchase_probability'],
+        bins=[0, 0.2, 0.5, 0.8, 1.0],
+        labels=['Low (<20%)', 'Medium (20-50%)', 'High (50-80%)', 'Very High (>80%)'],
+        include_lowest=True
+    )
     hist = px.histogram(
         predictions,
         x='no_purchase_probability',
+        color='Risk band',
         nbins=20,
-        labels={'no_purchase_probability': 'Estimated probability of no purchase next 30 days'},
-        title='Distribution of inactivity scores',
+        color_discrete_map={
+            'Low (<20%)': '#00CC96',
+            'Medium (20-50%)': '#FFA15A',
+            'High (50-80%)': '#EF553B',
+            'Very High (>80%)': '#AB63FA',
+        },
+        labels={'no_purchase_probability': 'Estimated probability of no purchase next 30 days', 'count': 'Customers'},
+        title='Distribution of inactivity scores by risk band',
     )
-    hist.update_layout(height=330, yaxis_title='Customers')
+    hist.update_layout(height=330, yaxis_title='Customers', bargap=0.05)
     st.plotly_chart(hist, use_container_width=True)
 
     shown = predictions.head(100).copy()
