@@ -12,6 +12,14 @@ certification, and full browser validation with the actual datasets remains requ
 
 ![Customer analytics dashboard](docs/screenshots/dashboard.png)
 
+## Demo data source
+
+The included demo dataset is a cleaned version of **UCI Online Retail II**:
+
+> **Source:** Chen, D. & Hsu, W. (2020). *Online Retail II*. UCI Machine Learning Repository. <https://doi.org/10.24432/C5T95Q>
+
+This dataset contains one year of transactional data (01/12/2009–09/12/2011) for a UK-based online retail store. The cleaned Parquet file (`sample_data/online_retail_ii_cleaned.parquet`) used in this project was derived from the original UCI CSV by standardizing column names, handling missing values, and casting types.
+
 ## Architecture
 
 ```text
