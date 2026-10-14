@@ -121,10 +121,12 @@ def _normalise_date(value: Any) -> pd.Timestamp:
     return pd.Timestamp(parsed).tz_convert(None).normalize()
 
 
-def prepare_transactions(transactions: pd.DataFrame) -> pd.DataFrame:
-    """Validate and prepare transaction lines without using future-derived metrics."""
-    if not isinstance(transactions, pd.DataFrame):
-        raise TypeError("transactions must be a pandas DataFrame.")
+def prepare_transactions(transactions: pl.DataFrame | pd.DataFrame) -> pd.DataFrame:
+    """Validate and prepare transaction lines without using future-derived metrics.
+
+    Accepts either Polars or pandas DataFrame. Returns pandas DataFrame.
+    """
+    transactions = _to_pandas(transactions)
     missing = REQUIRED_COLUMNS.difference(transactions.columns)
     if missing:
         raise ValueError("Missing required transaction columns: " + ", ".join(sorted(missing)))
