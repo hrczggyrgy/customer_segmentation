@@ -306,12 +306,23 @@ def fit_frozen_model(
     )
 
 
+def align_features(features_df: pl.DataFrame, frozen: FrozenPreprocessing) -> pl.DataFrame:
+    """Ensure features_df has all columns expected by frozen model, filling missing with 0."""
+    missing = [c for c in frozen.feature_names if c not in features_df.columns]
+    if missing:
+        # Add missing columns filled with 0
+        features_df = features_df.with_columns([pl.lit(0.0).alias(c) for c in missing])
+    # Select only the expected columns in the correct order
+    return features_df.select(frozen.feature_names)
+
+
 def assign_clusters_frozen(
     features_df: pl.DataFrame,
     frozen: FrozenPreprocessing
 ) -> np.ndarray:
     """Assign cluster labels using frozen preprocessing and model."""
-    pca_data = frozen.transform(features_df)
+    aligned = align_features(features_df, frozen)
+    pca_data = frozen.transform(aligned)
     return frozen.kmeans.predict(pca_data)
 
 
@@ -659,12 +670,12 @@ def render_segment_migration(
                     if i == 0:
                         # Use the labels from fitting (already computed inside fit_frozen_model)
                         snap.cluster_labels = frozen.kmeans.labels_
-                        snap.pca_data = frozen.pca.transform(
-                            frozen.transform(snap.features_df)
-                        )
+                        aligned = align_features(snap.features_df, frozen)
+                        snap.pca_data = frozen.pca.transform(frozen.transform(aligned))
                     else:
                         snap.cluster_labels = assign_clusters_frozen(snap.features_df, frozen)
-                        snap.pca_data = frozen.transform(snap.features_df)
+                        aligned = align_features(snap.features_df, frozen)
+                        snap.pca_data = frozen.transform(aligned)
                 
                 # Build Sankey data
                 sankey_data, switch_df = build_sankey_data(snapshots, config)
