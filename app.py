@@ -367,10 +367,9 @@ if uploaded_transactions is not None:
         st.session_state.retention_result = None
         st.sidebar.info("New data detected. Generate segments below.")
 elif st.session_state.tx_df is None:
-    # Demo dataset selector
+    # Demo dataset selector - only includes files that exist in the repo
     demo_files = {
         "Online Retail II (cleaned)": "sample_data/online_retail_ii_cleaned.parquet",
-        "Customer Transactions (legacy)": "customer_transactions_clean.parquet",
     }
     selected_demo = st.sidebar.selectbox(
         "Demo dataset",
