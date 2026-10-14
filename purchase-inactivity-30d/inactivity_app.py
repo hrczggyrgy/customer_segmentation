@@ -5,14 +5,12 @@ import hashlib
 import io
 
 import numpy as np
-import pandas as pd
 import plotly.express as px
 import polars as pl
 import streamlit as st
 
 from purchase_inactivity import (
     FEATURE_COLUMNS,
-    FEATURE_LABELS,
     explain_customer,
     fit_evaluate_and_score,
     global_feature_effects,

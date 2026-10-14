@@ -2,9 +2,17 @@ import sys
 import types
 import unittest
 from unittest.mock import patch
+
 import numpy as np
 import pandas as pd
-from frontend_storytelling import contribution_metrics, segment_differentiators, render_contribution, render_profiles, segment_profiles
+
+from frontend_storytelling import (
+    contribution_metrics,
+    render_contribution,
+    render_profiles,
+    segment_differentiators,
+    segment_profiles,
+)
 
 
 class InsightTests(unittest.TestCase):

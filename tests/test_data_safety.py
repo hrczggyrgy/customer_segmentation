@@ -2,11 +2,18 @@ import ast
 import hashlib
 import importlib.util
 import io
-from pathlib import Path
 import tempfile
 import unittest
 from datetime import date, datetime
-from data_safety import source_fingerprint, generate_session_segments, finalized_month_end, period_is_finalized, retention_matrix
+from pathlib import Path
+
+from data_safety import (
+    finalized_month_end,
+    generate_session_segments,
+    period_is_finalized,
+    retention_matrix,
+    source_fingerprint,
+)
 
 
 class SafetyTests(unittest.TestCase):

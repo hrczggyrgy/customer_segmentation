@@ -1,4 +1,5 @@
 import unittest
+
 import polars as pl
 
 # Copy the functions here to avoid importing app (which runs Streamlit code)

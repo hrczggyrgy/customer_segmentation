@@ -10,9 +10,8 @@ This module builds a customer migration Sankey diagram by:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
-from typing import Optional
+from dataclasses import dataclass
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
@@ -101,8 +100,8 @@ class SnapshotResult:
 
 def select_snapshot_dates(
     tx_df: pl.DataFrame | pl.LazyFrame,
-    start_date: Optional[date] = None,
-    end_date: Optional[date] = None
+    start_date: date | None = None,
+    end_date: date | None = None
 ) -> tuple[date, date, date]:
     """Automatically select three snapshot dates from the transaction date range.
     
@@ -292,7 +291,6 @@ def fit_frozen_model(
     
     kmeans = KMeans(n_clusters=best_k, random_state=config.random_state, n_init=10)
     kmeans.fit(pca_data)
-    cluster_labels = kmeans.labels_
     
     return FrozenPreprocessing(
         feature_names=feature_names,
@@ -432,7 +430,7 @@ def build_sankey_data(
         transitions.append(trans_counts)
     
     # Combine all transitions
-    all_trans = pd.concat(transitions, ignore_index=True)
+    pd.concat(transitions, ignore_index=True)
     
     # Build Sankey nodes (distinct per column even if same label)
     # Format: "Snap1: M1 · high-spend overdue", "Snap1: M2 · low-spend on-cadence", ...
@@ -506,7 +504,7 @@ def build_sankey_data(
         if len(m_both) > 0:
             switch_rate = (m_both[from_col] != m_both[to_col]).mean() * 100
             total = len(m_both)
-            from_counts = m_both.groupby(from_col)[to_col].apply(list).to_dict()
+            m_both.groupby(from_col)[to_col].apply(list).to_dict()
             switch_rows.append({
                 'transition': f'{from_col} → {to_col}',
                 'customers_in_migration_segments': total,
@@ -534,29 +532,29 @@ def create_sankey_figure(sankey_data: dict) -> go.Figure:
     """Create Plotly Sankey figure from sankey_data dict."""
     fig = go.Figure(go.Sankey(
         arrangement='snap',
-        node=dict(
-            label=sankey_data['node_labels'],
-            color=sankey_data['node_colors'],
-            pad=20,
-            thickness=20,
-            line=dict(color='rgba(0,0,0,0.1)', width=1),
-        ),
-        link=dict(
-            source=sankey_data['links']['source'],
-            target=sankey_data['links']['target'],
-            value=sankey_data['links']['value'],
-            color='rgba(100, 116, 139, 0.25)',
-            hovertemplate='%{customdata}<extra></extra>',
-            customdata=sankey_data['links']['hover'],
-        ),
+        node={
+            'label': sankey_data['node_labels'],
+            'color': sankey_data['node_colors'],
+            'pad': 20,
+            'thickness': 20,
+            'line': {'color': 'rgba(0,0,0,0.1)', 'width': 1},
+        },
+        link={
+            'source': sankey_data['links']['source'],
+            'target': sankey_data['links']['target'],
+            'value': sankey_data['links']['value'],
+            'color': 'rgba(100, 116, 139, 0.25)',
+            'hovertemplate': '%{customdata}<extra></extra>',
+            'customdata': sankey_data['links']['hover'],
+        },
     ))
     
     fig.update_layout(
         title='Customer Migration Across Three Snapshots',
-        font=dict(family='Inter, system-ui, sans-serif', size=12, color='#1e293b'),
+        font={'family': 'Inter, system-ui, sans-serif', 'size': 12, 'color': '#1e293b'},
         paper_bgcolor='#ffffff',
         plot_bgcolor='#ffffff',
-        margin=dict(l=40, r=40, t=60, b=40),
+        margin={'l': 40, 'r': 40, 't': 60, 'b': 40},
         height=600,
     )
     
@@ -604,7 +602,7 @@ def render_segment_migration(
     tx_df: pl.DataFrame,
     source_fingerprint: str,
     key_prefix: str = 'segment_migration',
-    config: Optional[MigrationConfig] = None,
+    config: MigrationConfig | None = None,
 ) -> None:
     """Render the Segment Migration Sankey panel in Streamlit.
     
@@ -777,7 +775,7 @@ def render_segment_migration(
     switch_df = results['switch_df']
     profiles_df = results['profiles_df']
     window_days = results['window_days']
-    snapshot_dates = results['snapshot_dates']
+    results['snapshot_dates']
     
     # Snapshot summary table
     st.markdown('### Snapshot windows and coverage')

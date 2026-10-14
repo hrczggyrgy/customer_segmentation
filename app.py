@@ -1,57 +1,72 @@
-import streamlit as st
-import polars as pl
+import io
+import logging
+from datetime import date, timedelta
+
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
-import numpy as np
-import io
-import hashlib
-import logging
-from datetime import date, timedelta
-from segmentation import AdvancedCustomerSegmentation
-from data_safety import source_fingerprint, generate_session_segments, finalized_month_end, month_end, retention_matrix
+import polars as pl
+import streamlit as st
+
+from customer_segment_DNA import DNAConfig, feature_catalog, render_segment_dna
+from data_safety import (
+    finalized_month_end,
+    generate_session_segments,
+    month_end,
+    retention_matrix,
+    source_fingerprint,
+)
 from frontend_storytelling import (
-    METRICS, prepare_customers, segment_profiles, render_contribution,
-    render_profiles, render_risk, render_zscore_small_multiples,
+    METRICS,
+    prepare_customers,
+    render_contribution,
+    render_profiles,
+    render_risk,
+    render_zscore_small_multiples,
+    segment_profiles,
 )
 from purchase_inactivity import (
     FEATURE_COLUMNS as INACTIVITY_FEATURE_COLUMNS,
-    FEATURE_LABELS as INACTIVITY_FEATURE_LABELS,
+)
+from purchase_inactivity import (
     explain_customer,
     fit_evaluate_and_score,
     global_feature_effects,
+)
+from purchase_inactivity import (
     prepare_transactions as prepare_inactivity_transactions,
 )
-from customer_segment_DNA import DNAConfig, render_segment_dna, feature_catalog
 from segment_migration import render_segment_migration
+from segmentation import AdvancedCustomerSegmentation
 
 logger = logging.getLogger(__name__)
 
 # ---- Plotly brand template ----
 BRAND_TEMPLATE = go.layout.Template(
     layout=go.Layout(
-        font=dict(family="Inter, system-ui, sans-serif", size=12, color="#0F172A"),
-        title=dict(font=dict(size=16, color="#0F172A"), x=0.02, xanchor="left"),
+        font={"family": "Inter, system-ui, sans-serif", "size": 12, "color": "#0F172A"},
+        title={"font": {"size": 16, "color": "#0F172A"}, "x": 0.02, "xanchor": "left"},
         paper_bgcolor="#FFFFFF",
         plot_bgcolor="#FFFFFF",
         colorway=["#2563EB", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A", "#19D3F3", "#FF6692", "#B6E880"],
-        xaxis=dict(
-            gridcolor="#E2E8F0", zerolinecolor="#E2E8F0", showgrid=True, zeroline=True,
-            title=dict(font=dict(size=12, color="#0F172A")),
-            tickfont=dict(size=11, color="#0F172A")
-        ),
-        yaxis=dict(
-            gridcolor="#E2E8F0", zerolinecolor="#E2E8F0", showgrid=True, zeroline=True,
-            title=dict(font=dict(size=12, color="#0F172A")),
-            tickfont=dict(size=11, color="#0F172A"), automargin=True
-        ),
-        legend=dict(
-            bgcolor="rgba(255,255,255,0.9)", bordercolor="#E2E8F0", borderwidth=1,
-            font=dict(size=11, color="#0F172A"), yanchor="top", y=1.0, xanchor="left", x=1.02
-        ),
-        margin=dict(l=60, r=120, t=50, b=40),
-        hoverlabel=dict(bgcolor="#FFFFFF", bordercolor="#E2E8F0", font=dict(size=11, color="#0F172A")),
+        xaxis={
+            "gridcolor": "#E2E8F0", "zerolinecolor": "#E2E8F0", "showgrid": True, "zeroline": True,
+            "title": {"font": {"size": 12, "color": "#0F172A"}},
+            "tickfont": {"size": 11, "color": "#0F172A"}
+        },
+        yaxis={
+            "gridcolor": "#E2E8F0", "zerolinecolor": "#E2E8F0", "showgrid": True, "zeroline": True,
+            "title": {"font": {"size": 12, "color": "#0F172A"}},
+            "tickfont": {"size": 11, "color": "#0F172A"}, "automargin": True
+        },
+        legend={
+            "bgcolor": "rgba(255,255,255,0.9)", "bordercolor": "#E2E8F0", "borderwidth": 1,
+            "font": {"size": 11, "color": "#0F172A"}, "yanchor": "top", "y": 1.0, "xanchor": "left", "x": 1.02
+        },
+        margin={"l": 60, "r": 120, "t": 50, "b": 40},
+        hoverlabel={"bgcolor": "#FFFFFF", "bordercolor": "#E2E8F0", "font": {"size": 11, "color": "#0F172A"}},
     )
 )
 pio.templates["brand"] = BRAND_TEMPLATE
@@ -88,10 +103,12 @@ def pca_variance_diagnostics(metadata, fingerprint):
     if (ratios.ndim != 1 or ratios.size == 0 or not np.isfinite(ratios).all()
             or (ratios < 0).any() or (ratios > 1).any() or ratios.sum() > 1 + 1e-6):
         return None
-    if cumulative is not None:
-        if (cumulative.shape != ratios.shape or not np.isfinite(cumulative).all()
-                or not np.allclose(cumulative, np.cumsum(ratios), atol=1e-6)):
-            return None
+    if cumulative is not None and (
+        cumulative.shape != ratios.shape
+        or not np.isfinite(cumulative).all()
+        or not np.allclose(cumulative, np.cumsum(ratios), atol=1e-6)
+    ):
+        return None
     return ratios, cumulative
 
 
@@ -596,7 +613,7 @@ with tab3:
     if dist.empty:
         st.info('No plottable observations for this metric and axis setting.')
     else:
-        plot_options = dict(x='Segment', y=metric, color='Segment', color_discrete_map=colors, category_orders=category_orders, points='outliers', log_y=log, labels={metric: METRICS[metric]})
+        plot_options = {"x": 'Segment', "y": metric, "color": 'Segment', "color_discrete_map": colors, "category_orders": category_orders, "points": 'outliers', "log_y": log, "labels": {metric: METRICS[metric]}}
         fig = px.violin(dist, box=True, **plot_options) if plot_type == 'Violin plot' else px.box(dist, **plot_options)
         fig.update_layout(height=500, showlegend=False)
         st.plotly_chart(fig, use_container_width=True, theme=None)
@@ -613,18 +630,18 @@ with tab4:
         is_3d = projection.startswith('3D')
         axes = ['PC1', 'PC2', 'PC3'] if is_3d else ['PC1', 'PC3' if projection.endswith('PC3') else 'PC2']
         axis_labels = {pc: pc_axis_label(pc, variance) for pc in axes}
-        options = dict(color='Segment', color_discrete_map=colors, category_orders=category_orders, hover_name='customer_id', hover_data=['Total_Lifetime_Spend', 'Average_Order_Value_AOV', 'Primary_Category_Name'], opacity=.65, labels=axis_labels)
+        options = {"color": 'Segment', "color_discrete_map": colors, "category_orders": category_orders, "hover_name": 'customer_id', "hover_data": ['Total_Lifetime_Spend', 'Average_Order_Value_AOV', 'Primary_Category_Name'], "opacity": .65, "labels": axis_labels}
         fig = px.scatter_3d(view, x='PC1', y='PC2', z='PC3', **options) if is_3d else px.scatter(view, x=axes[0], y=axes[1], **options)
         centers = view.groupby('Segment')[axes].mean().reindex(order).dropna()
         for label, center in centers.iterrows():
-            coords = dict(x=[center[axes[0]]], y=[center[axes[1]]])
+            coords = {"x": [center[axes[0]]], "y": [center[axes[1]]]}
             if is_3d:
                 coords['z'] = [center[axes[2]]]
             trace = go.Scatter3d if is_3d else go.Scatter
             fig.add_trace(trace(**coords, mode='markers+text', text=[f'C{label_to_cluster[label]}'], textposition='top center',
                 name=f'{label} center', showlegend=False, hovertext=[label],
                 hovertemplate='%{hovertext}<br>Segment center: mean PC coordinates of displayed customers<extra></extra>',
-                marker=dict(size=9 if is_3d else 14, color=colors[label], symbol='diamond', line=dict(color='black', width=2))))
+                marker={"size": 9 if is_3d else 14, "color": colors[label], "symbol": 'diamond', "line": {"color": 'black', "width": 2}}))
         fig.update_layout(height=600)
         st.plotly_chart(fig, use_container_width=True, theme=None)
         missing_axes = [pc for pc in axes if pc not in variance]
@@ -656,7 +673,7 @@ with tab4:
                 if evc is not None:
                     fig.add_trace(go.Scatter(x=pcs, y=evc * 100, name='Cumulative', mode='lines+markers', yaxis='y2'))
                     st.caption(f'Total explained variance ({len(evr)} components): {evc[-1]:.1%}')
-                fig.update_layout(height=350, yaxis_title='Individual variance (%)', yaxis2=dict(title='Cumulative (%)', overlaying='y', side='right', range=[0, 100]))
+                fig.update_layout(height=350, yaxis_title='Individual variance (%)', yaxis2={"title": 'Cumulative (%)', "overlaying": 'y', "side": 'right', "range": [0, 100]})
                 st.plotly_chart(fig, use_container_width=True, theme=None)
             loadings, names = metadata.get('loadings'), metadata.get('feature_names')
             try:
@@ -848,46 +865,46 @@ with tab6:
         y_prob = result['holdout_y_prob']
         
         st.subheader('Model evaluation curves')
-        from sklearn.metrics import roc_curve, precision_recall_curve
         from sklearn.calibration import calibration_curve
+        from sklearn.metrics import precision_recall_curve, roc_curve
         
         curve_col1, curve_col2, curve_col3 = st.columns(3)
         
         # ROC Curve
         fpr, tpr, _ = roc_curve(y_true, y_prob)
         roc_fig = go.Figure()
-        roc_fig.add_trace(go.Scatter(x=fpr, y=tpr, mode='lines', name=f'ROC (AUC={evaluation["roc_auc"]:.3f})', line=dict(color='#2563EB', width=2)))
-        roc_fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode='lines', name='Random', line=dict(color='#94A3B8', width=1, dash='dash')))
+        roc_fig.add_trace(go.Scatter(x=fpr, y=tpr, mode='lines', name=f'ROC (AUC={evaluation["roc_auc"]:.3f})', line={"color": '#2563EB', "width": 2}))
+        roc_fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode='lines', name='Random', line={"color": '#94A3B8', "width": 1, "dash": 'dash'}))
         roc_fig.update_layout(
             title='ROC Curve', xaxis_title='False Positive Rate', yaxis_title='True Positive Rate',
-            height=300, legend=dict(yanchor='bottom', y=0.01, xanchor='right', x=0.99),
-            margin=dict(l=40, r=20, t=40, b=40)
+            height=300, legend={"yanchor": 'bottom', "y": 0.01, "xanchor": 'right', "x": 0.99},
+            margin={"l": 40, "r": 20, "t": 40, "b": 40}
         )
         curve_col1.plotly_chart(roc_fig, use_container_width=True, theme=None)
         
         # Precision-Recall Curve
         precision, recall, _ = precision_recall_curve(y_true, y_prob)
         pr_fig = go.Figure()
-        pr_fig.add_trace(go.Scatter(x=recall, y=precision, mode='lines', name=f'PR (AP={evaluation["average_precision"]:.3f})', line=dict(color='#EF553B', width=2)))
+        pr_fig.add_trace(go.Scatter(x=recall, y=precision, mode='lines', name=f'PR (AP={evaluation["average_precision"]:.3f})', line={"color": '#EF553B', "width": 2}))
         # Baseline (prevalence)
         baseline = y_true.mean()
         pr_fig.add_hline(y=baseline, line_dash='dash', line_color='#94A3B8', annotation_text=f'Baseline ({baseline:.1%})', annotation_position='bottom right')
         pr_fig.update_layout(
             title='Precision-Recall Curve', xaxis_title='Recall', yaxis_title='Precision',
-            height=300, legend=dict(yanchor='bottom', y=0.01, xanchor='right', x=0.99),
-            margin=dict(l=40, r=20, t=40, b=40), yaxis_range=[0, 1.05]
+            height=300, legend={"yanchor": 'bottom', "y": 0.01, "xanchor": 'right', "x": 0.99},
+            margin={"l": 40, "r": 20, "t": 40, "b": 40}, yaxis_range=[0, 1.05]
         )
         curve_col2.plotly_chart(pr_fig, use_container_width=True, theme=None)
         
         # Calibration (Reliability) Plot
         prob_true, prob_pred = calibration_curve(y_true, y_prob, n_bins=10, strategy='quantile')
         cal_fig = go.Figure()
-        cal_fig.add_trace(go.Scatter(x=prob_pred, y=prob_true, mode='lines+markers', name='Model', line=dict(color='#00CC96', width=2), marker=dict(size=6)))
-        cal_fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode='lines', name='Perfectly calibrated', line=dict(color='#94A3B8', width=1, dash='dash')))
+        cal_fig.add_trace(go.Scatter(x=prob_pred, y=prob_true, mode='lines+markers', name='Model', line={"color": '#00CC96', "width": 2}, marker={"size": 6}))
+        cal_fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode='lines', name='Perfectly calibrated', line={"color": '#94A3B8', "width": 1, "dash": 'dash'}))
         cal_fig.update_layout(
             title='Calibration Plot', xaxis_title='Mean predicted probability', yaxis_title='Fraction of positives',
-            height=300, legend=dict(yanchor='bottom', y=0.01, xanchor='right', x=0.99),
-            margin=dict(l=40, r=20, t=40, b=40)
+            height=300, legend={"yanchor": 'bottom', "y": 0.01, "xanchor": 'right', "x": 0.99},
+            margin={"l": 40, "r": 20, "t": 40, "b": 40}
         )
         curve_col3.plotly_chart(cal_fig, use_container_width=True, theme=None)
         

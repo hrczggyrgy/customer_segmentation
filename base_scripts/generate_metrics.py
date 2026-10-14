@@ -1,8 +1,9 @@
 #generate_metrics.py
 
-import polars as pl
-import pandas as pd
 import warnings
+
+import pandas as pd
+import polars as pl
 
 warnings.filterwarnings('ignore')
 

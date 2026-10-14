@@ -356,11 +356,11 @@ def fit_evaluate_and_score(
     y_test = test_rows[TARGET_COLUMN].to_numpy(dtype=int)
     has_both_classes = len(np.unique(y_test)) == 2
     evaluation = {
-        "n_snapshots": int(len(snapshot_dates)),
+        "n_snapshots": len(snapshot_dates),
         "train_snapshots": int(train_rows["snapshot_date"].nunique()),
         "test_snapshots": int(test_rows["snapshot_date"].nunique()),
-        "n_train": int(len(train_rows)),
-        "n_test": int(len(test_rows)),
+        "n_train": len(train_rows),
+        "n_test": len(test_rows),
         "test_start": str(test_start.date()),
         "test_end": str(pd.Timestamp(test_rows["snapshot_date"].max()).date()),
         "test_no_purchase_rate": float(np.mean(y_test)) if len(y_test) else float("nan"),

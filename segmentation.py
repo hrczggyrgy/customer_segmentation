@@ -1,11 +1,12 @@
-import polars as pl
-import numpy as np
-from datetime import timedelta
-from sklearn.preprocessing import RobustScaler
-from sklearn.decomposition import PCA
-from sklearn.cluster import KMeans
-from sklearn.metrics import davies_bouldin_score
 import warnings
+from datetime import timedelta
+
+import numpy as np
+import polars as pl
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.metrics import davies_bouldin_score
+from sklearn.preprocessing import RobustScaler
 
 warnings.filterwarnings('ignore')
 
@@ -280,7 +281,9 @@ class AdvancedCustomerSegmentation:
         elif isinstance(data_source, pl.LazyFrame):
             lazy_df = data_source
         else:
-            raise ValueError("Invalid data source")
+            raise TypeError(
+                f"Expected str, pl.DataFrame, or pl.LazyFrame; got {type(data_source).__name__}"
+            )
 
         print("1. Validating and Cleaning Data...")
         clean_lazy = self.validate_and_clean(lazy_df)
@@ -290,7 +293,7 @@ class AdvancedCustomerSegmentation:
         print(f"   -> Generated 50+ features for {len(polars_features)} unique customers.")
         
         print("3. Preprocessing Data (Winsorization, RobustScaling & PCA)...")
-        pca_data, feature_names = self._preprocess_data(polars_features)
+        pca_data, _feature_names = self._preprocess_data(polars_features)
         
         print("4. Optimizing Cluster Count on Principal Components...")
         self.optimal_k = self._find_optimal_k(pca_data)
@@ -312,7 +315,7 @@ class AdvancedCustomerSegmentation:
         
         return result
 
-    def get_pca_metadata(self, fingerprint: str = None) -> dict:
+    def get_pca_metadata(self, fingerprint: str | None = None) -> dict:
         """Return PCA metadata for interpretability."""
         if self._pca_explained_variance is None:
             return {}
@@ -328,7 +331,7 @@ class AdvancedCustomerSegmentation:
             metadata['source_fingerprint'] = fingerprint
         return metadata
 
-    def save_metadata(self, path: str = "pca_metadata.json", fingerprint: str = None):
+    def save_metadata(self, path: str = "pca_metadata.json", fingerprint: str | None = None):
         """Save PCA metadata to JSON file."""
         import json
         metadata = self.get_pca_metadata(fingerprint)

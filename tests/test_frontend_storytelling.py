@@ -1,7 +1,14 @@
 import unittest
+
 import numpy as np
 import pandas as pd
-from frontend_storytelling import prepare_customers, segment_profiles, profile_matrix, selected_customer_ids
+
+from frontend_storytelling import (
+    prepare_customers,
+    profile_matrix,
+    segment_profiles,
+    selected_customer_ids,
+)
 
 
 class StorytellingTests(unittest.TestCase):

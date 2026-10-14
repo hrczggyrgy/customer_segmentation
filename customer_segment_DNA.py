@@ -50,10 +50,10 @@ explanations, or cluster membership explanations.
 """
 from __future__ import annotations
 
+import hashlib
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Mapping, Sequence
-import hashlib
 
 import numpy as np
 import pandas as pd
@@ -243,7 +243,7 @@ def summarize_features(data: pd.DataFrame, segment: str, config: DNAConfig) -> p
 
     for field in ("label", "group", "unit", "definition"):
         out[field] = out["feature"].map(
-            lambda name: getattr(catalog[name], field)
+            lambda name, f=field: getattr(catalog[name], f)
         )
     return out
 
@@ -324,7 +324,7 @@ def format_value(value, unit="", currency="CU") -> str:
 
 
 def _chart(st, figure, key):
-    figure.update_layout(template="plotly_white", margin=dict(l=20, r=20, t=50, b=20))
+    figure.update_layout(template="plotly_white", margin={"l": 20, "r": 20, "t": 50, "b": 20})
     st.plotly_chart(figure, use_container_width=True, key=key)
 
 
@@ -343,9 +343,9 @@ def render_segment_dna(customers: pd.DataFrame, *,
     Optional economics/transactions are validated independently; their errors
     disable only their respective views. Main input errors return None.
     """
-    import streamlit as st
     import plotly.express as px
     import plotly.graph_objects as go
+    import streamlit as st
 
     cfg = config or DNAConfig()
     st.header("Segment DNA")
@@ -401,7 +401,7 @@ def render_segment_dna(customers: pd.DataFrame, *,
                     f"{spend_share:.1%} of known spend" if pd.notna(spend_share) else None, delta_color="off")
     index = row.get("contribution_index", np.nan)
     cards[2].metric("Spend contribution index", format_value(index, "ratio"))
-    orders = subset[cfg.orders_col].sum(min_count=1) if cfg.orders_col in subset else np.nan
+    subset[cfg.orders_col].sum(min_count=1) if cfg.orders_col in subset else np.nan
     # Weighted AOV uses paired spend/order coverage, never mismatched sums.
     aov = np.nan
     if {cfg.spend_col, cfg.orders_col}.issubset(subset):
@@ -572,11 +572,11 @@ def render_segment_dna(customers: pd.DataFrame, *,
                         colorscale="RdBu",
                         zmid=0,
                         hoverongaps=False,
-                        colorbar=dict(title="Base SD"),
+                        colorbar={"title": "Base SD"},
                     ))
                     fig.update_layout(
                         height=max(320, 45 * len(z)),
-                        xaxis=dict(tickangle=-45),
+                        xaxis={"tickangle": -45},
                     )
                     _chart(st, fig, f"{prefix}_comparison_heatmap")
 
@@ -770,20 +770,20 @@ def make_demo_data(seed: int = 42, n: int = 600) -> tuple[pd.DataFrame, pd.DataF
         tenure = (dates[-1] - dates[0]).days
         cadence = tenure / (count - 1) if count > 1 else 0
         for j in range(count):
-            lines.append(dict(customer_id=cid, transaction_id=f"{cid}-{j}",
-                              transaction_date=dates[j], price=prices[j], quantity=int(units[j]), category=cats[j]))
+            lines.append({"customer_id": cid, "transaction_id": f"{cid}-{j}",
+                              "transaction_date": dates[j], "price": prices[j], "quantity": int(units[j]), "category": cats[j]})
         category_spend = pd.Series(values).groupby(cats).sum()
-        rows.append(dict(customer_id=cid, Cluster=cluster, Total_Lifetime_Spend=spend,
-                         Total_Lifetime_Units=units.sum(), Total_Lifetime_Transactions=count,
-                         Average_Order_Value_AOV=spend / count, Average_Unit_Retail_AUR=spend / units.sum(),
-                         Recency_Days=recency, Tenure_Days=tenure, Active_Days=count,
-                         Average_InterPurchase_Time_AIPT=cadence,
-                         Churn_Risk_Index_CRI=recency / cadence if cadence > 0 else 0,
-                         Average_Units_Per_Transaction_UPT=units.mean(), Max_Basket_Value=values.max(),
-                         Min_Basket_Value=values.min(), Basket_Value_Variance=values.std(ddof=1) if count > 1 else 0,
-                         Single_Item_Basket_Propensity=(units == 1).mean(), Category_Width=len(set(cats)),
-                         Category_Concentration_Score=category_spend.max() / spend,
-                         Median_Item_Price=np.median(prices), Price_Variability_Score=prices.std(ddof=1) if count > 1 else 0))
+        rows.append({"customer_id": cid, "Cluster": cluster, "Total_Lifetime_Spend": spend,
+                         "Total_Lifetime_Units": units.sum(), "Total_Lifetime_Transactions": count,
+                         "Average_Order_Value_AOV": spend / count, "Average_Unit_Retail_AUR": spend / units.sum(),
+                         "Recency_Days": recency, "Tenure_Days": tenure, "Active_Days": count,
+                         "Average_InterPurchase_Time_AIPT": cadence,
+                         "Churn_Risk_Index_CRI": recency / cadence if cadence > 0 else 0,
+                         "Average_Units_Per_Transaction_UPT": units.mean(), "Max_Basket_Value": values.max(),
+                         "Min_Basket_Value": values.min(), "Basket_Value_Variance": values.std(ddof=1) if count > 1 else 0,
+                         "Single_Item_Basket_Propensity": (units == 1).mean(), "Category_Width": len(set(cats)),
+                         "Category_Concentration_Score": category_spend.max() / spend,
+                         "Median_Item_Price": np.median(prices), "Price_Variability_Score": prices.std(ddof=1) if count > 1 else 0})
     customers = pd.DataFrame(rows)
     economics = pd.DataFrame({"customer_id": customers.customer_id,
                              "gross_profit": customers.Total_Lifetime_Spend * rng.uniform(.18, .4, n),

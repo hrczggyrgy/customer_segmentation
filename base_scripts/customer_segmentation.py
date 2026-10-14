@@ -1,14 +1,13 @@
 #customer_segmentation.py               
 
-import polars as pl
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
 import warnings
 
-
+import numpy as np
+import pandas as pd
+import polars as pl
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings('ignore')
 
@@ -169,7 +168,9 @@ class PolarsCustomerSegmentation:
         elif isinstance(data_source, pl.LazyFrame):
             lazy_df = data_source
         else:
-            raise ValueError("data_source must be a file path, pl.DataFrame, or pl.LazyFrame")
+            raise TypeError(
+                f"Expected str, pl.DataFrame, or pl.LazyFrame; got {type(data_source).__name__}"
+            )
 
         print("1. Validating and Cleaning Data (Lazy)...")
         clean_lazy = self.validate_and_clean(lazy_df)

@@ -1,8 +1,8 @@
-import pandas as pd
-import numpy as np
-import seaborn as sns
 import matplotlib.pyplot as plt
+import pandas as pd
 import plotly.graph_objects as go
+import seaborn as sns
+
 
 def plot_cohort_retention(transactions_df):
     """Generates a Triangular Cohort Retention Heatmap."""
@@ -70,14 +70,14 @@ def plot_customer_journey_sankey(transactions_df):
     
     # Plotly Sankey
     fig = go.Figure(data=[go.Sankey(
-        node=dict(
-            pad=20, thickness=30, line=dict(color="black", width=0.5),
-            label=unique_nodes, color="lightblue"
-        ),
-        link=dict(
-            source=links['Source_ID'], target=links['Target_ID'], value=links['Count'],
-            color="rgba(173, 216, 230, 0.4)"
-        )
+        node={
+            'pad': 20, 'thickness': 30, 'line': {'color': "black", 'width': 0.5},
+            'label': unique_nodes, 'color': "lightblue"
+        },
+        link={
+            'source': links['Source_ID'], 'target': links['Target_ID'], 'value': links['Count'],
+            'color': "rgba(173, 216, 230, 0.4)"
+        }
     )])
     
     fig.update_layout(title_text="Customer Journey: Category Migration (First 3 Purchases)", font_size=12)

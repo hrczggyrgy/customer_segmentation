@@ -1,14 +1,14 @@
-#!/usr/bin/env python3
 """
 Full End-to-End EDA with Polars
 Customer Transaction Data Analysis
 """
 
-import polars as pl
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
 from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import polars as pl
+import seaborn as sns
 
 # Configure plotting
 plt.style.use('seaborn-v0_8-whitegrid')
@@ -710,4 +710,4 @@ print(f"\n✅ EDA Complete! Outputs saved to {OUTPUT_DIR}/")
 print("Generated files:")
 for f in sorted(OUTPUT_DIR.glob("*.png")):
     print(f"  - {f.name}")
-print(f"  - eda_summary.txt")
+print("  - eda_summary.txt")

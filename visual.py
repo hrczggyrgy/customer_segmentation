@@ -1,10 +1,10 @@
-import pandas as pd
-import numpy as np
+import warnings
+from math import pi
+
 import matplotlib.pyplot as plt
+import pandas as pd
 import seaborn as sns
 from sklearn.preprocessing import MinMaxScaler
-from math import pi
-import warnings
 
 warnings.filterwarnings('ignore')
 
@@ -70,7 +70,7 @@ class AdvancedSegmentationVisualizer:
         angles = [n / float(N) * 2 * pi for n in range(N)]
         angles += angles[:1]
         
-        fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(polar=True))
+        _fig, ax = plt.subplots(figsize=(10, 10), subplot_kw={'polar': True})
         ax.set_theta_offset(pi / 2)
         ax.set_theta_direction(-1)
         

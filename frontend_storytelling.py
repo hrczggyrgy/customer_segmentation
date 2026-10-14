@@ -15,46 +15,46 @@ REQUIRED = {"customer_id", "Cluster", "Total_Lifetime_Spend", "Average_Order_Val
 # 'format' renders raw averages with units; 'definition' says how the feature is built;
 # 'above'/'below' describe the direction without implying better or worse performance.
 METRIC_NARRATIVES = {
-    'Total_Lifetime_Spend': dict(
-        format='${:,.2f}',
-        definition='Sum of quantity x price over observed purchase lines.',
-        above='Higher historical spend in the observed period; not predicted lifetime value.',
-        below='Lower historical spend in the observed period; not predicted lifetime value.'),
-    'Average_Order_Value_AOV': dict(
-        format='${:,.2f}',
-        definition='Observed spend divided by distinct transaction IDs.',
-        above='Larger average spend per transaction.',
-        below='Smaller average spend per transaction.'),
-    'Recency_Days': dict(
-        format='{:,.1f} days',
-        definition='Days from the last observed purchase to the day after the latest date in the data.',
-        above='Longer since the last observed purchase; a timing description, not a verdict on loyalty.',
-        below='More recent last observed purchase.'),
-    'Total_Lifetime_Transactions': dict(
-        format='{:,.2f} transactions',
-        definition='Distinct transaction IDs observed per customer.',
-        above='More distinct transactions in the observed period.',
-        below='Fewer distinct transactions in the observed period.'),
-    'Category_Width': dict(
-        format='{:,.2f} categories',
-        definition='Distinct product categories purchased.',
-        above='Purchases span more product categories.',
-        below='Purchases are concentrated in fewer product categories.'),
-    'Average_InterPurchase_Time_AIPT': dict(
-        format='{:,.1f} days',
-        definition='Mean gap between distinct purchase dates; zero with fewer than two purchase dates.',
-        above='Longer gaps between purchase dates.',
-        below='Shorter gaps between purchase dates, or zeros from single-date customers; check repeat-history coverage.'),
-    'Churn_Risk_Index_CRI': dict(
-        format='{:,.2f}x',
-        definition='Recency divided by average purchase interval when that interval is positive; otherwise zero.',
-        above='Recency is large relative to typical purchase gaps; a descriptive delay ratio, not a churn probability.',
-        below='Lower delay ratio; zero for single-date customers does not indicate healthy behavior.'),
-    'Inferred_Discount_Affinity': dict(
-        format='{:,.3f} lines/unit',
-        definition='Lines priced below 80% of the SKU maximum observed price, divided by purchased units.',
-        above='More below-80%-of-maximum-price lines per unit; not a discount percentage or share of transactions.',
-        below='Fewer below-80%-of-maximum-price lines per unit; not a discount percentage or share of transactions.'),
+    'Total_Lifetime_Spend': {
+        "format": '${:,.2f}',
+        "definition": 'Sum of quantity x price over observed purchase lines.',
+        "above": 'Higher historical spend in the observed period; not predicted lifetime value.',
+        "below": 'Lower historical spend in the observed period; not predicted lifetime value.'},
+    'Average_Order_Value_AOV': {
+        "format": '${:,.2f}',
+        "definition": 'Observed spend divided by distinct transaction IDs.',
+        "above": 'Larger average spend per transaction.',
+        "below": 'Smaller average spend per transaction.'},
+    'Recency_Days': {
+        "format": '{:,.1f} days',
+        "definition": 'Days from the last observed purchase to the day after the latest date in the data.',
+        "above": 'Longer since the last observed purchase; a timing description, not a verdict on loyalty.',
+        "below": 'More recent last observed purchase.'},
+    'Total_Lifetime_Transactions': {
+        "format": '{:,.2f} transactions',
+        "definition": 'Distinct transaction IDs observed per customer.',
+        "above": 'More distinct transactions in the observed period.',
+        "below": 'Fewer distinct transactions in the observed period.'},
+    'Category_Width': {
+        "format": '{:,.2f} categories',
+        "definition": 'Distinct product categories purchased.',
+        "above": 'Purchases span more product categories.',
+        "below": 'Purchases are concentrated in fewer product categories.'},
+    'Average_InterPurchase_Time_AIPT': {
+        "format": '{:,.1f} days',
+        "definition": 'Mean gap between distinct purchase dates; zero with fewer than two purchase dates.',
+        "above": 'Longer gaps between purchase dates.',
+        "below": 'Shorter gaps between purchase dates, or zeros from single-date customers; check repeat-history coverage.'},
+    'Churn_Risk_Index_CRI': {
+        "format": '{:,.2f}x',
+        "definition": 'Recency divided by average purchase interval when that interval is positive; otherwise zero.',
+        "above": 'Recency is large relative to typical purchase gaps; a descriptive delay ratio, not a churn probability.',
+        "below": 'Lower delay ratio; zero for single-date customers does not indicate healthy behavior.'},
+    'Inferred_Discount_Affinity': {
+        "format": '{:,.3f} lines/unit',
+        "definition": 'Lines priced below 80% of the SKU maximum observed price, divided by purchased units.',
+        "above": 'More below-80%-of-maximum-price lines per unit; not a discount percentage or share of transactions.',
+        "below": 'Fewer below-80%-of-maximum-price lines per unit; not a discount percentage or share of transactions.'},
 }
 
 
@@ -158,9 +158,9 @@ def segment_differentiators(customers, cluster_order, max_traits=3, min_abs_z=0.
             direction = 'above' if score > 0 else 'below'
             spec = METRIC_NARRATIVES.get(metric, {})
             context = spec.get('above' if score > 0 else 'below', '')
-            traits.append(dict(metric=metric, label=METRICS[metric], z_score=float(score),
-                direction=direction, segment_mean=float(raw), overall_mean=float(overall),
-                context=context, definition=spec.get('definition', '')))
+            traits.append({"metric": metric, "label": METRICS[metric], "z_score": float(score),
+                "direction": direction, "segment_mean": float(raw), "overall_mean": float(overall),
+                "context": context, "definition": spec.get('definition', '')})
         result[cluster] = traits
     return result
 
@@ -233,10 +233,10 @@ def render_contribution(profiles, selected, colors):
     fig.update_layout(
         barmode='group',
         height=max(300, len(order) * 45),
-        margin=dict(t=30, b=30),
+        margin={"t": 30, "b": 30},
         showlegend=True,
         legend_title_text='',
-        yaxis=dict(automargin=True),
+        yaxis={"automargin": True},
     )
     fig.update_xaxes(range=[0, 105])
     st.plotly_chart(fig, use_container_width=True, theme=None)
@@ -307,8 +307,8 @@ def render_profiles(customers, profiles, selected):
 def render_risk(customers, selected, colors, order, source_fingerprint, currency="CU"):
     import hashlib
     import inspect
+
     import plotly.express as px
-    import plotly.graph_objects as go
     import streamlit as st
     
     st.header("Risk–value portfolio")
@@ -394,7 +394,7 @@ def render_risk(customers, selected, colors, order, source_fingerprint, currency
 
     repeat_history = work["Average_InterPurchase_Time_AIPT"].gt(0)
     valid_spend = work["Total_Lifetime_Spend"].ge(0)
-    valid_delay = work["Churn_Risk_Index_CRI"].ge(0)
+    work["Churn_Risk_Index_CRI"].ge(0)
 
     base_spend = work.loc[
         repeat_history & valid_spend, "Total_Lifetime_Spend"
@@ -523,8 +523,8 @@ def render_risk(customers, selected, colors, order, source_fingerprint, currency
         )
 
         fig.update_traces(
-            marker=dict(size=6),
-            selector=dict(type="scattergl"),
+            marker={"size": 6},
+            selector={"type": "scattergl"},
             hovertemplate=(
                 "Customer: %{customdata[0]}<br>"
                 "Segment: %{customdata[5]}<br>"
@@ -616,7 +616,7 @@ def render_risk(customers, selected, colors, order, source_fingerprint, currency
                 y0=float(threshold),
                 y1=float(plot["Total_Lifetime_Spend"].max()),
                 fillcolor="rgba(239,85,59,0.06)",
-                line=dict(width=1, color="#EF553B", dash="dash"),
+                line={"width": 1, "color": "#EF553B", "dash": "dash"},
                 layer="below",
             )
 
@@ -624,13 +624,13 @@ def render_risk(customers, selected, colors, order, source_fingerprint, currency
             height=580,
             dragmode="lasso",
             hovermode="closest",
-            legend=dict(
-                orientation="h",
-                x=0, y=-0.18,
-                xanchor="left", yanchor="top",
-                title_text="",
-            ),
-            margin=dict(l=55, r=25, t=45, b=130),
+            legend={
+                "orientation": "h",
+                "x": 0, "y": -0.18,
+                "xanchor": "left", "yanchor": "top",
+                "title_text": "",
+            },
+            margin={"l": 55, "r": 25, "t": 45, "b": 130},
         )
 
         fig.update_yaxes(title=f"Observed spend ({currency})")
@@ -777,11 +777,10 @@ def render_zscore_small_multiples(customers, profiles, selected, colors, order):
     fig.update_xaxes(range=[-3.5, 3.5], dtick=1)
     # Clean facet titles
     fig.for_each_annotation(lambda a: a.update(text=a.text.split('=')[-1]))
-    fig.update_layout(showlegend=False, margin=dict(l=10, r=10, t=60, b=40))
+    fig.update_layout(showlegend=False, margin={"l": 10, "r": 10, "t": 60, "b": 40})
     st.plotly_chart(fig, use_container_width=True, theme=None)
 
 
 def render_radar(customers, selected, colors, order):
     """Deprecated: kept for backward compatibility. Use render_zscore_small_multiples instead."""
     # Radar chart removed; small multiples are more honest (stable z-scores vs. selection-dependent min-max)
-    pass
