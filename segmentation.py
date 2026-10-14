@@ -39,7 +39,7 @@ class AdvancedCustomerSegmentation:
               .then(pl.lit("__UNKNOWN__")).otherwise(pl.col('department')).alias('department'),
             pl.when(pl.col('category').is_null() | (pl.col('category') == ""))
               .then(pl.lit("__UNKNOWN__")).otherwise(pl.col('category')).alias('category'),
-            pl.col('transaction_date').cast(pl.Datetime, strict=False),
+            pl.col('transaction_date').str.to_datetime(strict=False),
             pl.col('price').cast(pl.Float64, strict=False),
             pl.col('quantity').cast(pl.Float64, strict=False)
         ])

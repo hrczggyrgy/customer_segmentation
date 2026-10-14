@@ -161,7 +161,7 @@ def validate_transactions(df: pl.DataFrame) -> tuple[pl.DataFrame, int]:
             .cast(pl.String, strict=False).fill_null("__UNKNOWN__"),
         pl.col("category")
             .cast(pl.String, strict=False).fill_null("__UNKNOWN__"),
-        pl.col("transaction_date").cast(pl.Datetime, strict=False),
+        pl.col("transaction_date").str.to_datetime(strict=False),
         pl.col("price").cast(pl.Float64, strict=False),
         pl.col("quantity").cast(pl.Float64, strict=False),
     ])

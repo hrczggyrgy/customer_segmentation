@@ -51,7 +51,7 @@ class PolarsCustomerSegmentation:
 
         # 3. Cast numeric and datetime columns
         df_cleaned = df_cleaned.with_columns([
-            pl.col('transaction_date').cast(pl.Datetime, strict=False),
+            pl.col('transaction_date').str.to_datetime(strict=False),
             pl.col('price').cast(pl.Float64, strict=False),
             pl.col('quantity').cast(pl.Float64, strict=False)
         ])
