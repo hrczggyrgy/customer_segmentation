@@ -19,6 +19,92 @@ tests/test_data_safety.py       Fingerprint, isolation, completeness, retention 
 docs/FRONTEND_STORYTELLING.md   Frontend interpretation and validation notes
 ```
 
+## Data processing pipeline
+
+The diagram separates model training, cohort retention, and output handling.
+The dashboard and offline CLI share the segmentation implementation and source
+fingerprint helper, but only the offline workflow writes generated artifacts.
+
+```mermaid
+flowchart TB
+    subgraph INPUT["01 | Source ingestion and identity"]
+        SOURCE["Cleaned transaction Parquet<br/>Dashboard upload or local file"]
+        HASH["Full SHA-256 of source bytes<br/>data_safety.source_fingerprint"]
+        LOAD["Polars transaction dataset<br/>Read into memory or scan lazily"]
+        MODE{"Execution mode"}
+        SOURCE --> HASH --> LOAD --> MODE
+    end
+
+    CONTEXT["Dashboard session<br/>Transaction data and source fingerprint"]
+    REUSE{"Matching segments and<br/>PCA metadata in this session?"}
+    MODE -->|Dashboard| CONTEXT
+    CONTEXT --> REUSE
+
+    subgraph MODEL["02 | Behavioral segmentation - segmentation.py"]
+        VALIDATE["Validate and clean with Polars<br/>Cast schema, normalize missing fields<br/>Filter invalid IDs, dates, prices and quantities"]
+        FEATURES["Engineer customer-level features<br/>Recency, frequency and observed spend<br/>Basket, category, cadence and price behavior"]
+        PREPROCESS["Robust preprocessing with Polars<br/>NaN and null handling; P99 upper capping<br/>Selected log1p transforms; median / IQR scaling"]
+        PCA["NumPy boundary and scikit-learn PCA<br/>Six principal components"]
+        SELECT["Select cluster count<br/>Evaluate KMeans for k = 3 to 8<br/>Minimize Davies-Bouldin index"]
+        FIT["Fit final KMeans<br/>Assign each customer to a cluster"]
+        RESULTS["Customer features, cluster IDs and PC1-PC6<br/>PCA variance and loadings metadata"]
+        VALIDATE --> FEATURES --> PREPROCESS --> PCA --> SELECT --> FIT --> RESULTS
+    end
+
+    MODE -->|Offline CLI| VALIDATE
+    REUSE -->|No match or force regeneration| VALIDATE
+
+    subgraph RETENTION["03 | Full-base cohort retention - data_safety.py"]
+        COHORTS["First observed purchase cohorts<br/>Count distinct customers by cohort and period"]
+        CUTOFF["Apply finalized calendar-month cutoff<br/>Exclude latest observed month by default<br/>Allow source-confirmed completeness date"]
+        MATRIX["Normalize by initial cohort size<br/>Unfinished periods remain null<br/>Finalized periods with no returns become 0%"]
+        COHORTS --> CUTOFF --> MATRIX
+    end
+    CONTEXT -->|Loaded transactions; independent of segment filters| COHORTS
+
+    subgraph OUTPUT["04 | Results and visual storytelling"]
+        SESSION["Session-only segmentation results<br/>Segments and fingerprint-matched PCA metadata<br/>No shared result cache or generated-artifact files"]
+        RETAIN["Session-only retention matrix<br/>Reuse by source fingerprint and cutoff"]
+        PRESENT["Customer-level presentation<br/>Full-base benchmarks and segment descriptors<br/>Pandas conversion only for presentation"]
+        DASHBOARD["Streamlit and Plotly dashboard<br/>Contribution, profiles and customer drill-down<br/>Distributions, PCA diagnostics and retention"]
+        EXPORT[("Controlled offline exports<br/>customer_segments_advanced.parquet<br/>pca_metadata.json")]
+        SESSION --> PRESENT --> DASHBOARD
+        RETAIN --> DASHBOARD
+    end
+
+    REUSE -->|Yes; reuse current session| SESSION
+    RESULTS -->|Dashboard workflow| SESSION
+    RESULTS -.->|Offline CLI only| EXPORT
+    MATRIX --> RETAIN
+
+    classDef input fill:#EFF6FF,stroke:#2563EB,color:#0F172A,stroke-width:1.5px;
+    classDef decision fill:#FFFBEB,stroke:#D97706,color:#0F172A,stroke-width:1.5px;
+    classDef process fill:#F0FDF4,stroke:#16A34A,color:#0F172A,stroke-width:1.5px;
+    classDef model fill:#F5F3FF,stroke:#7C3AED,color:#0F172A,stroke-width:1.5px;
+    classDef retention fill:#ECFEFF,stroke:#0891B2,color:#0F172A,stroke-width:1.5px;
+    classDef session fill:#F0FDFA,stroke:#0D9488,color:#0F172A,stroke-width:1.5px;
+    classDef dashboard fill:#1E3A8A,stroke:#1E3A8A,color:#FFFFFF,stroke-width:2px;
+    classDef offline fill:#F8FAFC,stroke:#64748B,color:#334155,stroke-width:1.5px,stroke-dasharray:5 5;
+
+    class SOURCE,HASH,LOAD,CONTEXT input;
+    class MODE,REUSE decision;
+    class VALIDATE,FEATURES,PREPROCESS process;
+    class PCA,SELECT,FIT,RESULTS model;
+    class COHORTS,CUTOFF,MATRIX retention;
+    class SESSION,RETAIN,PRESENT session;
+    class DASHBOARD dashboard;
+    class EXPORT offline;
+```
+
+- Polars handles transaction validation, feature engineering, preprocessing,
+  and cohort calculations. NumPy conversion occurs at the model-fitting boundary.
+- Retention uses the loaded full transaction base, not the model's validated
+  transaction subset or the selected customer segments.
+- Solid arrows show processing and result flow; the dashed arrow marks optional
+  offline exports. Those exports are not loaded by the dashboard.
+- Session isolation and source fingerprints organize results; they do not imply
+  authentication, anonymization, or a security certification.
+
 ## Dashboard
 
 - Customer share versus observed-spend share with stable full-base denominators.
