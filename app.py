@@ -170,7 +170,11 @@ def validate_transactions(df: pl.DataFrame) -> tuple[pl.DataFrame, int]:
     for col in ["customer_id", "transaction_id", "product_id"]:
         if df[col].dtype != pl.String:
             try:
-                df = df.with_columns(pl.col(col).cast(pl.String))
+                # If it's datetime, convert to ISO format string
+                if df[col].dtype in (pl.Datetime, pl.Date):
+                    df = df.with_columns(pl.col(col).dt.strftime("%Y-%m-%d"))
+                else:
+                    df = df.with_columns(pl.col(col).cast(pl.String))
             except Exception:
                 raise ValueError(
                     f"Column '{col}' could not be converted to string. "

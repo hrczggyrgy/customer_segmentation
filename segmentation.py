@@ -28,10 +28,18 @@ class AdvancedCustomerSegmentation:
         str_cols = ['customer_id', 'transaction_id', 'product_id', 
                     'product_description', 'department', 'category']
         
-        df_cleaned = lazy_df.with_columns([
-            pl.col(c).cast(pl.Utf8, strict=False).str.strip_chars() 
-            for c in str_cols if c in lazy_df.collect_schema().names()
-        ])
+        # Build expressions that safely convert to string
+        str_exprs = []
+        for c in str_cols:
+            if c in lazy_df.collect_schema().names():
+                # Check if column is datetime and convert appropriately
+                dtype = lazy_df.collect_schema()[c]
+                if dtype in (pl.Datetime, pl.Date):
+                    str_exprs.append(pl.col(c).dt.strftime("%Y-%m-%d").alias(c))
+                else:
+                    str_exprs.append(pl.col(c).cast(pl.Utf8, strict=False).str.strip_chars().alias(c))
+        
+        df_cleaned = lazy_df.with_columns(str_exprs)
 
         df_cleaned = df_cleaned.with_columns([
             pl.col('product_description').fill_null(""),
