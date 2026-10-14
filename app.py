@@ -390,7 +390,12 @@ elif st.session_state.tx_df is None:
     
     try:
         raw_df = pl.read_parquet(demo_path)
-        new_tx_df, dropped_rows = validate_transactions(raw_df)
+        
+        # Apply column mapping for demo files (same as upload)
+        suggested_mapping = suggest_column_mapping(raw_df.columns)
+        mapped_df = apply_column_mapping(raw_df, suggested_mapping)
+        
+        new_tx_df, dropped_rows = validate_transactions(mapped_df)
         st.session_state.tx_df = new_tx_df
         st.session_state.tx_fingerprint = source_fingerprint(demo_path)
         if dropped_rows:
