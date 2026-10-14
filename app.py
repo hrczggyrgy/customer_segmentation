@@ -31,25 +31,27 @@ logger = logging.getLogger(__name__)
 # ---- Plotly brand template ----
 BRAND_TEMPLATE = go.layout.Template(
     layout=go.Layout(
-        font=dict(family="Inter, system-ui, sans-serif", size=12, color="#1E293B"),
-        title=dict(font=dict(size=16, color="#1E293B"), x=0.02, xanchor="left"),
+        font=dict(family="Inter, system-ui, sans-serif", size=12, color="#0F172A"),
+        title=dict(font=dict(size=16, color="#0F172A"), x=0.02, xanchor="left"),
         paper_bgcolor="#FFFFFF",
         plot_bgcolor="#FFFFFF",
         colorway=["#2563EB", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A", "#19D3F3", "#FF6692", "#B6E880"],
         xaxis=dict(
             gridcolor="#E2E8F0", zerolinecolor="#E2E8F0", showgrid=True, zeroline=True,
-            title=dict(font=dict(size=12)), tickfont=dict(size=11)
+            title=dict(font=dict(size=12, color="#0F172A")),
+            tickfont=dict(size=11, color="#0F172A")
         ),
         yaxis=dict(
             gridcolor="#E2E8F0", zerolinecolor="#E2E8F0", showgrid=True, zeroline=True,
-            title=dict(font=dict(size=12)), tickfont=dict(size=11), automargin=True
+            title=dict(font=dict(size=12, color="#0F172A")),
+            tickfont=dict(size=11, color="#0F172A"), automargin=True
         ),
         legend=dict(
-            bgcolor="rgba(255,255,255,0.8)", bordercolor="#E2E8F0", borderwidth=1,
-            font=dict(size=11), yanchor="top", y=1.0, xanchor="left", x=1.02
+            bgcolor="rgba(255,255,255,0.9)", bordercolor="#E2E8F0", borderwidth=1,
+            font=dict(size=11, color="#0F172A"), yanchor="top", y=1.0, xanchor="left", x=1.02
         ),
         margin=dict(l=60, r=120, t=50, b=40),
-        hoverlabel=dict(bgcolor="#FFFFFF", bordercolor="#E2E8F0", font=dict(size=11)),
+        hoverlabel=dict(bgcolor="#FFFFFF", bordercolor="#E2E8F0", font=dict(size=11, color="#0F172A")),
     )
 )
 pio.templates["brand"] = BRAND_TEMPLATE
