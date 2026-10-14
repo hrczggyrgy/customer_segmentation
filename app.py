@@ -119,6 +119,26 @@ REQUIRED_TX_COLUMNS = {
     "transaction_date", "price", "quantity",
 }
 
+# Optional columns that can be mapped if present
+OPTIONAL_TX_COLUMNS = {
+    "product_description": "product_description",
+    "department": "department",
+    "category": "category",
+}
+
+# Default column name suggestions for common variations
+COLUMN_ALIASES = {
+    "customer_id": ["customer_id", "customerid", "cust_id", "client_id", "user_id", "buyer_id"],
+    "transaction_id": ["transaction_id", "transactionid", "txn_id", "order_id", "orderid", "invoice_id"],
+    "product_id": ["product_id", "productid", "sku", "item_id", "itemid"],
+    "product_description": ["product_description", "productdescription", "description", "product_name", "productname", "item_description"],
+    "department": ["department", "dept", "division", "category_group"],
+    "category": ["category", "cat", "product_category", "subcategory"],
+    "transaction_date": ["transaction_date", "transactiondate", "date", "order_date", "orderdate", "purchase_date", "purchasedate", "txn_date"],
+    "price": ["price", "unit_price", "unitprice", "amount", "cost", "sale_price"],
+    "quantity": ["quantity", "qty", "units", "quantity_sold", "units_sold"],
+}
+
 
 def validate_transactions(df: pl.DataFrame) -> tuple[pl.DataFrame, int]:
     """Validate and clean uploaded transaction Parquet.
@@ -182,6 +202,28 @@ def reset_inactivity_state():
         st.session_state.pop(key, None)
 
 
+def suggest_column_mapping(df_columns: list[str]) -> dict[str, str]:
+    """Suggest mappings from dataframe columns to required columns based on aliases."""
+    mapping = {}
+    df_cols_lower = {c.lower(): c for c in df_columns}
+    
+    for required_col, aliases in COLUMN_ALIASES.items():
+        for alias in aliases:
+            if alias.lower() in df_cols_lower:
+                mapping[required_col] = df_cols_lower[alias.lower()]
+                break
+    return mapping
+
+
+def apply_column_mapping(df: pl.DataFrame, mapping: dict[str, str]) -> pl.DataFrame:
+    """Apply column mapping by renaming columns in the DataFrame."""
+    # Create reverse mapping: source_col -> target_col
+    rename_dict = {v: k for k, v in mapping.items() if v in df.columns}
+    if rename_dict:
+        df = df.rename(rename_dict)
+    return df
+
+
 def cohort_sizes(lazy_transactions):
     '''Distinct customers per first-purchase month, from the full transaction base.'''
     sizes = (lazy_transactions.group_by('customer_id')
@@ -240,22 +282,82 @@ with st.sidebar.expander("Expected input format"):
 if uploaded_transactions is not None:
     new_fp = source_fingerprint(uploaded_transactions)
     if st.session_state.tx_fingerprint != new_fp:
-        # Read and validate the new dataset first
+        # Read the new dataset
         try:
             raw_df = pl.read_parquet(
                 io.BytesIO(uploaded_transactions.getvalue())
             )
-            new_tx_df, dropped_rows = validate_transactions(raw_df)
         except Exception:
             st.sidebar.error(
                 "The upload could not be processed. Check that it is a "
-                "readable Parquet file with the required columns and valid data."
+                "readable Parquet file."
             )
             st.stop()
+
+        # Column mapping UI
+        st.sidebar.subheader("Column Mapping")
+        st.sidebar.caption("Map your columns to the required schema. Auto-detected mappings are pre-filled.")
+        
+        detected_cols = raw_df.columns
+        suggested_mapping = suggest_column_mapping(detected_cols)
+        
+        # Build the mapping UI
+        final_mapping = {}
+        cols_to_map = list(REQUIRED_TX_COLUMNS)
+        
+        # Show required columns first
+        for req_col in sorted(cols_to_map):
+            default = suggested_mapping.get(req_col, "")
+            options = [""] + detected_cols
+            try:
+                default_idx = options.index(default) if default else 0
+            except ValueError:
+                default_idx = 0
+            
+            selected = st.sidebar.selectbox(
+                f"{req_col} (required)",
+                options=options,
+                index=default_idx,
+                key=f"map_{req_col}_{new_fp[:8]}",
+                help=f"Select the column in your data that corresponds to '{req_col}'"
+            )
+            if selected:
+                final_mapping[req_col] = selected
+        
+        # Optional columns
+        with st.sidebar.expander("Optional columns"):
+            for opt_col in sorted(OPTIONAL_TX_COLUMNS.keys()):
+                default = suggested_mapping.get(opt_col, "")
+                options = [""] + detected_cols
+                try:
+                    default_idx = options.index(default) if default else 0
+                except ValueError:
+                    default_idx = 0
+                
+                selected = st.sidebar.selectbox(
+                    f"{opt_col} (optional)",
+                    options=options,
+                    index=default_idx,
+                    key=f"map_{opt_col}_{new_fp[:8]}",
+                    help=f"Select the column in your data that corresponds to '{opt_col}'"
+                )
+                if selected:
+                    final_mapping[opt_col] = selected
+        
+        # Apply mapping and validate
+        mapped_df = apply_column_mapping(raw_df, final_mapping)
+        
+        try:
+            new_tx_df, dropped_rows = validate_transactions(mapped_df)
+        except Exception as e:
+            st.sidebar.error(f"Validation failed: {e}")
+            st.stop()
+        
         if dropped_rows:
             st.sidebar.warning(
                 f"{dropped_rows:,} invalid transaction rows were excluded."
             )
+        
         reset_inactivity_state()
         st.session_state.tx_df = new_tx_df
         st.session_state.tx_fingerprint = new_fp
