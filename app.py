@@ -23,6 +23,7 @@ from purchase_inactivity import (
     global_feature_effects,
     prepare_transactions as prepare_inactivity_transactions,
 )
+from customer_segment_DNA import DNAConfig, render_segment_dna
 
 logger = logging.getLogger(__name__)
 
@@ -471,7 +472,61 @@ for column, title, value in zip(st.columns(4),
     column.metric(title, value)
 
 render_contribution(profiles, selected, colors)
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(['Risk–Value Portfolio', 'Segment Profiles', 'Distributions', 'Model Exploration', 'Retention', 'Purchase Inactivity'])
+
+tab1, tab2, tab3, tab4, tab5, tab6, tab_dna = st.tabs(
+    [
+        "Risk–Value Portfolio",
+        "Segment Profiles",
+        "Distributions",
+        "Model Exploration",
+        "Retention",
+        "Purchase Inactivity",
+        "Segment DNA",
+    ]
+)
+
+with tab_dna:
+    dna_currency = st.text_input(
+        "Currency code / monetary unit",
+        value="CU",
+        key="segment_dna_currency",
+        help=(
+            "Enter the currency used by your source data, such as GBP, "
+            "EUR, or HUF. CU means unspecified currency units. "
+            "This labels values; it does not convert currencies."
+        ),
+    ).strip() or "CU"
+
+    show_purchase_details = st.checkbox(
+        "Include category mix and monthly spend trends",
+        value=False,
+        key="segment_dna_purchase_details",
+        help="Enable this to include transaction-level purchase charts.",
+    )
+
+    dna_transactions = None
+
+    if show_purchase_details:
+        dna_transactions = tx_df.select(
+            [
+                "customer_id",
+                "transaction_id",
+                "transaction_date",
+                "price",
+                "quantity",
+                "category",
+            ]
+        ).to_pandas()
+
+    render_segment_dna(
+        customers=segments_df.to_pandas(),
+        transactions=dna_transactions,
+        config=DNAConfig(currency=dna_currency),
+        eligible_segments=selected,
+        segment_labels=labels,
+        key_prefix=f"segment_dna_{st.session_state.tx_fingerprint}",
+    )
+
 with tab1:
     render_risk(customers, selected, colors, order, st.session_state.tx_fingerprint)
 with tab2:
