@@ -29,7 +29,7 @@ class AdvancedCustomerSegmentation:
                     'product_description', 'department', 'category']
         
         df_cleaned = lazy_df.with_columns([
-            pl.col(c).cast(pl.Utf8).str.strip_chars() 
+            pl.col(c).cast(pl.Utf8, strict=False).str.strip_chars() 
             for c in str_cols if c in lazy_df.collect_schema().names()
         ])
 

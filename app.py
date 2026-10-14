@@ -166,6 +166,18 @@ def validate_transactions(df: pl.DataFrame) -> tuple[pl.DataFrame, int]:
         pl.col("quantity").cast(pl.Float64, strict=False),
     ])
 
+    # Ensure string ID columns are actually strings (catch bad column mappings)
+    for col in ["customer_id", "transaction_id", "product_id"]:
+        if df[col].dtype != pl.String:
+            try:
+                df = df.with_columns(pl.col(col).cast(pl.String))
+            except Exception:
+                raise ValueError(
+                    f"Column '{col}' could not be converted to string. "
+                    f"Please check your column mapping - the selected column "
+                    f"may contain incompatible data (e.g., dates instead of IDs)."
+                )
+
     valid = (
         pl.col("customer_id").is_not_null() & (pl.col("customer_id") != "") &
         pl.col("transaction_id").is_not_null() & (pl.col("transaction_id") != "") &
