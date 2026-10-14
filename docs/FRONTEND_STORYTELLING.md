@@ -1,34 +1,31 @@
-# Integrated frontend improvements
+# Frontend interpretation and deployment checks
 
-Run `streamlit run app.py` as before. Upload cleaned transactions and generate
-segments. The existing five-tab dashboard now includes:
+The existing five-tab dashboard includes segment contribution charts,
+behavior-derived labels, benchmark heatmaps, distributions/radar, interactive
+customer drill-down, PCA diagnostics, and on-demand retention.
 
-- Dynamic segment descriptors with cluster IDs, consistent Safe-palette colors,
-  and hypotheses for marketing experiments, not validated action recommendations.
-- Aligned customer-share and observed-spend-share bars above the tabs; filtering
-  never changes the full-base denominators or profile benchmarks.
-- Ordered profile heatmaps with sample sizes, fixed -3/+3 color limits, raw
-  hover values, and an explicit warning that above average is not always better.
-- Point/box/lasso customer selection and ID-based drill-down in Risk–Value.
-  Default targets use repeat-buyer delay >=2 and a full-base repeat-buyer spend
-  percentile. Insufficient-history customers are crosses at x=0 for display only.
-- Existing distribution, normalized radar, PCA, and on-demand retention views.
+`frontend_storytelling.py` handles customer-level presentation. `data_safety.py`
+handles full-length fingerprints, session-only segmentation results, and the
+finalized retention boundary. Modeling logic in AdvancedCustomerSegmentation
+is unchanged; only the standalone fingerprint caller changes.
 
-The core feature engineering and modeling in segmentation.py are unchanged.
-Pandas is used only on the customer-level presentation dataset, not to replace
-the transaction pipeline. app.py's UI/control code is refactored; the invalid
-PCA except clause and the incorrect force-regeneration cache clear are fixed.
-Retention uses the full transaction base and is explicitly labeled as not
-responding to segment filters. The final observed month can be incomplete.
+Spend shares and heatmap benchmarks use the full customer base. Observed spend
+is historical, delay is not churn probability, and campaigns are hypotheses.
+Descriptions depend on the data; keep cluster IDs for traceability. Insufficient
+repeat history uses crosses at x=0 as a plotting convention. Non-positive spend
+is omitted only from logarithmic charts, not from summaries.
 
-Streamlit >=1.35 supports chart selection. An older-version fallback remains
-in the rendering helper. USD formatting follows the original app convention.
-New segment descriptions use full-base customer spend quartiles and repeat-buyer
-median delay; fewer than 50% eligible repeat buyers means limited repeat history.
+Dashboard results are not persisted as shared files or placed in a global
+Streamlit cache. Session-only state is not a substitute for authentication,
+transport security, compliance, or safe data handling. Prefer anonymized demo data.
 
-Tests: `python -m unittest discover -s tests -p 'test_frontend_storytelling.py' -v`
+Retention excludes the latest observed month by default. An explicitly confirmed
+data-complete-through date can include a known complete month. The cutoff is
+visible; immature periods are null and finalized absences remain 0%. Earlier
+source months must actually be complete for these assumptions to hold.
 
-Before deployment, run a browser smoke test with actual transaction data:
-upload and generate, filter segments, select points across multiple traces,
-verify IDs in the drill-down, inspect PCA metadata, generate retention, then
-upload different transactions and confirm that stale views cannot be reused.
+Run `python -m unittest discover -s tests -v`. Pure helper/session tests use
+synthetic data; Polars integration tests are skipped if Polars is unavailable.
+A real browser smoke test remains required: upload, force regenerate, switch
+datasets, use independent sessions, verify selected IDs and PCA metadata, and
+compare finalized retention with source-confirmed complete months.

@@ -5,10 +5,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
 import io
-import hashlib
-import json
 from datetime import timedelta
 from segmentation import AdvancedCustomerSegmentation
+from data_safety import source_fingerprint, generate_session_segments, finalized_month_end, month_end, retention_matrix
 from frontend_storytelling import (
     METRICS, prepare_customers, segment_profiles, render_contribution,
     render_profiles, render_risk, render_radar,
@@ -26,128 +25,51 @@ for key, default in {
         st.session_state[key] = default
 
 
-def compute_file_fingerprint(uploaded_file):
-    uploaded_file.seek(0)
-    content = uploaded_file.read()
-    uploaded_file.seek(0)
-    return hashlib.sha256(content).hexdigest()[:16]
-
-
-def compute_local_file_fingerprint(path):
-    with open(path, "rb") as file:
-        return hashlib.sha256(file.read()).hexdigest()[:16]
-
-
-@st.cache_data(show_spinner=False)
-def run_segmentation_pipeline(transactions_df, tx_fingerprint):
-    pipeline = AdvancedCustomerSegmentation(max_clusters=8, n_components=6)
-    segments = pipeline.fit_predict(transactions_df)
-    return segments, pipeline.get_pca_metadata(tx_fingerprint)
-
-
 def get_or_generate_segments(tx_df, tx_fingerprint, force_refresh=False):
-    if not force_refresh:
-        try:
-            segments = pl.read_parquet("customer_segments_advanced.parquet")
-            with open("pca_metadata.json", "r") as file:
-                metadata = json.load(file)
-            if metadata.get("source_fingerprint") == tx_fingerprint:
-                st.sidebar.success("Loaded matching local segments")
-                return segments, metadata
-            st.sidebar.warning("Local segments do not match. Regenerating...")
-        except (FileNotFoundError, json.JSONDecodeError):
-            pass
     if tx_df is None:
-        st.error("Upload transaction data first.")
+        st.error('Upload transactions first.')
         st.stop()
     try:
-        with st.sidebar.status("Running segmentation...", expanded=True) as status:
-            status.write("Engineering behavioral metrics, robust preprocessing, PCA, and KMeans...")
-            segments, metadata = run_segmentation_pipeline(tx_df, tx_fingerprint)
-            segments.write_parquet("customer_segments_advanced.parquet")
-            with open("pca_metadata.json", "w") as file:
-                json.dump(metadata, file, indent=2)
-            status.update(label="Segments generated and saved", state="complete")
-        return segments, metadata
+        with st.sidebar.status('Preparing session-only segments...', expanded=True) as status:
+            result = generate_session_segments(
+                st.session_state, tx_df, tx_fingerprint,
+                lambda: AdvancedCustomerSegmentation(max_clusters=8, n_components=6),
+                force=force_refresh,
+            )
+            status.update(label='Segments ready in this session', state='complete')
+        return result
     except Exception as error:
-        st.error(f"Segmentation failed: {error}")
+        st.error(f'Segmentation failed: {error}')
         st.stop()
 
 
-@st.cache_data
-def generate_retention_matrix_polars(transactions_lf):
-    df = transactions_lf.with_columns([
-        pl.col('transaction_date').dt.truncate('1mo').alias('OrderMonth'),
-    ]).with_columns([
-        pl.col('transaction_date').dt.truncate('1mo').alias('tx_month'),
-    ])
-    cohort_months = df.group_by('customer_id').agg(
-        pl.col('tx_month').min().alias('CohortMonth')
-    )
-    df = df.join(cohort_months, on='customer_id', how='left')
-    df = df.with_columns([
-        ((pl.col('OrderMonth').dt.year() - pl.col('CohortMonth').dt.year()) * 12 +
-         (pl.col('OrderMonth').dt.month() - pl.col('CohortMonth').dt.month())).alias('PeriodNumber')
-    ])
-    cohort_data = df.group_by(['CohortMonth', 'PeriodNumber']).agg(
-        pl.col('customer_id').n_unique().alias('customer_count')
-    ).collect()
-    cohort_pivot = cohort_data.pivot(
-        values='customer_count', index='CohortMonth', on='PeriodNumber',
-        aggregate_function='first'
-    ).sort('CohortMonth')
-    period_cols_int = []
-    for column in cohort_pivot.columns:
-        if column != 'CohortMonth':
-            try:
-                period_cols_int.append(int(column))
-            except (ValueError, TypeError):
-                pass
-    if period_cols_int:
-        period_cols_int.sort()
-        max_order_month = df.select(pl.col('OrderMonth').max()).collect().item()
-        if 0 in period_cols_int:
-            for period in period_cols_int:
-                if period != 0:
-                    column = str(period)
-                    cohort_pivot = cohort_pivot.with_columns(
-                        pl.when(
-                            (pl.col('0') > 0) &
-                            ((pl.col('CohortMonth').dt.year() * 12 + pl.col('CohortMonth').dt.month() + period) <=
-                             (max_order_month.year() * 12 + max_order_month.month()))
-                        ).then(
-                            pl.when(pl.col(column).is_not_null())
-                            .then(pl.col(column) / pl.col('0')).otherwise(pl.lit(0.0))
-                        ).otherwise(None).alias(column)
-                    )
-            cohort_pivot = cohort_pivot.with_columns(
-                pl.when(pl.col('0') > 0).then(pl.lit(1.0)).otherwise(None).alias('0')
-            )
-    return cohort_pivot.with_columns(
-        pl.col('CohortMonth').dt.strftime('%Y-%m').alias('Cohort')
-    ).drop('CohortMonth').select(['Cohort'] + [str(p) for p in period_cols_int])
-
+if st.session_state.tx_fingerprint and len(st.session_state.tx_fingerprint) != 64:
+    st.session_state.update(tx_df=None, tx_fingerprint=None, segments_df=None,
+        segments_fingerprint=None, segments_generated=False, pca_metadata=None,
+        show_retention=False, retention_key=None, retention_result=None)
 
 st.sidebar.header("Data upload")
 uploaded_transactions = st.sidebar.file_uploader(
     "Cleaned transactions (Parquet)", type=["parquet"],
-    help="Upload cleaned transaction data; segmentation runs only on request.",
+    help="Uploads and generated results stay in this session; the app does not save upload artifacts to disk.",
 )
 if uploaded_transactions is not None:
-    new_fp = compute_file_fingerprint(uploaded_transactions)
+    new_fp = source_fingerprint(uploaded_transactions)
     if st.session_state.tx_fingerprint != new_fp:
-        st.session_state.tx_df = pl.read_parquet(io.BytesIO(uploaded_transactions.read()))
+        st.session_state.tx_df = pl.read_parquet(io.BytesIO(uploaded_transactions.getvalue()))
         st.session_state.tx_fingerprint = new_fp
         st.session_state.segments_generated = False
         st.session_state.segments_df = None
         st.session_state.segments_fingerprint = None
         st.session_state.pca_metadata = None
         st.session_state.show_retention = False
+        st.session_state.retention_key = None
+        st.session_state.retention_result = None
         st.sidebar.info("New data detected. Generate segments below.")
 elif st.session_state.tx_df is None:
     try:
         st.session_state.tx_df = pl.read_parquet("customer_transactions_clean.parquet")
-        st.session_state.tx_fingerprint = compute_local_file_fingerprint("customer_transactions_clean.parquet")
+        st.session_state.tx_fingerprint = source_fingerprint("customer_transactions_clean.parquet")
     except FileNotFoundError:
         st.info("Upload cleaned transactions from the sidebar to begin.")
         st.stop()
@@ -157,10 +79,8 @@ tx_lazy = tx_df.lazy()
 st.sidebar.header("Segmentation controls")
 ready = st.session_state.segments_generated and st.session_state.segments_df is not None
 refresh = st.sidebar.button("Refresh segments" if ready else "Generate segments", type="primary", use_container_width=True)
-force = st.sidebar.button("Force regenerate", help="Bypass both saved segments and the cached pipeline result.", use_container_width=True)
+force = st.sidebar.button("Force regenerate", help="Recompute results for this session without clearing other visitors' results.", use_container_width=True)
 if refresh or force:
-    if force:
-        run_segmentation_pipeline.clear()
     with st.spinner("Preparing customer segments..."):
         segments, metadata = get_or_generate_segments(tx_df, st.session_state.tx_fingerprint, force_refresh=force)
         st.session_state.segments_df = segments
@@ -244,12 +164,6 @@ with tab4:
         st.info('PCA projections require PC1, PC2, and PC3 in the generated segments.')
     if st.checkbox('Show explained variance and loadings', value=True):
         metadata = st.session_state.pca_metadata
-        if metadata is None:
-            try:
-                with open('pca_metadata.json') as file:
-                    metadata = json.load(file)
-            except (FileNotFoundError, json.JSONDecodeError):
-                metadata = None
         if not metadata:
             st.info('Generate segments to populate PCA metadata.')
         elif metadata.get('source_fingerprint') != st.session_state.tx_fingerprint:
@@ -277,11 +191,24 @@ with tab4:
 with tab5:
     st.header('Monthly repeat-purchase retention')
     st.caption('Full transaction base; global segment filters do not change this view. Cohort = first observed purchase month. Missing cells are unobserved; 0% means an observed period with no returning customers.')
+    confirmed_complete = st.checkbox('I can confirm a data-complete-through date', value=False, key='retention_confirmed')
+    complete_through = None
+    if confirmed_complete:
+        complete_through = st.date_input('Data complete through (source-confirmed)',
+            value=finalized_month_end(max_date), max_value=month_end(max_date),
+            key='retention_complete_date_' + st.session_state.tx_fingerprint)
+    cutoff = finalized_month_end(max_date, complete_through)
+    st.caption(f'Finalized through {cutoff.isoformat()}. Later periods and cohorts are excluded. '
+               'Default excludes the latest observed month; this assumes earlier source months are complete.')
     if st.button('Generate retention matrix', type='primary'):
         st.session_state.show_retention = True
     if st.session_state.get('show_retention', False):
         with st.spinner('Computing cohort retention...'):
-            retention = generate_retention_matrix_polars(tx_lazy)
+            retention_key = (st.session_state.tx_fingerprint, cutoff.isoformat())
+            if st.session_state.get('retention_key') != retention_key or st.session_state.get('retention_result') is None:
+                st.session_state.retention_result = retention_matrix(tx_lazy, cutoff)
+                st.session_state.retention_key = retention_key
+            retention = st.session_state.retention_result
         if retention.height > 0 and retention.width > 1:
             matrix = retention.to_pandas().set_index('Cohort')
             fig = px.imshow(matrix, text_auto='.0%', aspect='auto', color_continuous_scale='YlGnBu', range_color=[0, 1])
@@ -292,9 +219,9 @@ with tab5:
             for column, period in zip(columns[:2], ['1', '3']):
                 if period in retention.columns:
                     value = retention[period].drop_nulls().mean()
-                    column.metric(f'Avg month {period} retention (observed)', f'{value:.1%}' if value is not None else 'N/A')
+                    column.metric(f'Avg month {period} retention (finalized)', f'{value:.1%}' if value is not None else 'N/A')
             columns[2].metric('Cohorts', retention.height)
-            st.caption('Averages weight cohorts equally. The final calendar month may be incomplete; observed does not mean a fully completed month.')
+            st.caption('Averages weight eligible finalized cohorts equally. Nulls are unfinished periods; observed zero-return periods remain 0%.')
         else:
             st.info('Insufficient transaction history for cohort analysis.')
 

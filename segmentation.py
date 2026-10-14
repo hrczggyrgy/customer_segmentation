@@ -336,14 +336,12 @@ class AdvancedCustomerSegmentation:
 # Example Usage
 # ==========================================
 if __name__ == "__main__":
-    import hashlib
+    from data_safety import source_fingerprint
     
     data_path = "customer_transactions_clean.parquet"
     
-    # Compute fingerprint from file content for deterministic fingerprinting
-    with open(data_path, 'rb') as f:
-        file_content = f.read()
-    fingerprint = hashlib.sha256(file_content).hexdigest()[:16]
+    # Shared full-length fingerprint for the controlled offline workflow.
+    fingerprint = source_fingerprint(data_path)
     
     pipeline = AdvancedCustomerSegmentation(max_clusters=8, n_components=6)
     segmented_customers = pipeline.fit_predict(data_path)
