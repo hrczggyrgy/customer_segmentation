@@ -12,9 +12,6 @@ certification, and full browser validation with the actual datasets remains requ
 
 ![Customer analytics dashboard](docs/screenshots/dashboard.png)
 
-> **To complete this section:**
-> 1. Screenshot: Run `streamlit run app.py`, open in browser, capture screenshot → save as `docs/screenshots/dashboard.png`
-
 ## Architecture
 
 ```text
