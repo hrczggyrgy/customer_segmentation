@@ -531,7 +531,7 @@ def render_risk(customers, selected, colors, order, source_fingerprint, currency
                 "Purchase delay: %{customdata[1]}<br>"
                 "Days since last purchase: %{customdata[2]:,.0f}<br>"
                 "Average purchase interval: %{customdata[3]:,.1f} days<br>"
-                f"Observed spend: {currency} %{customdata[4]:,.2f}"
+                "Observed spend: " + currency + " %{customdata[4]:,.2f}"
                 "<extra></extra>"
             ),
         )
