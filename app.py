@@ -23,7 +23,7 @@ from purchase_inactivity import (
     global_feature_effects,
     prepare_transactions as prepare_inactivity_transactions,
 )
-from customer_segment_DNA import DNAConfig, render_segment_dna
+from customer_segment_DNA import DNAConfig, render_segment_dna, feature_catalog
 
 logger = logging.getLogger(__name__)
 
@@ -507,28 +507,56 @@ with tab_dna:
     dna_transactions = None
 
     if show_purchase_details:
-        # Debug: show available columns
-        st.caption(f"Available columns in tx_df: {tx_df.columns}")
-        try:
-            dna_transactions = tx_df.select(
-                [
-                    "customer_id",
-                    "transaction_id",
-                    "transaction_date",
-                    "price",
-                    "quantity",
-                    "category",
-                ]
-            ).to_pandas()
-            st.caption(f"Transaction rows: {len(dna_transactions)}")
-        except Exception as e:
-            st.error(f"Failed to select transaction columns: {e}")
-            dna_transactions = None
+        # Debug diagnostics in an expander
+        with st.expander("Transaction data diagnostics", expanded=False):
+            st.caption(f"Available columns in tx_df: {tx_df.columns}")
+            try:
+                dna_transactions = tx_df.select(
+                    [
+                        "customer_id",
+                        "transaction_id",
+                        "transaction_date",
+                        "price",
+                        "quantity",
+                        "category",
+                    ]
+                ).to_pandas()
+                st.caption(f"Transaction rows: {len(dna_transactions)}")
+            except Exception as e:
+                st.error(f"Failed to select transaction columns: {e}")
+                dna_transactions = None
+
+    # Reuse Polars-to-Pandas conversion within the user session
+    dna_cfg = DNAConfig(currency=dna_currency)
+
+    dna_cols = list(dict.fromkeys([
+        dna_cfg.customer_col,
+        dna_cfg.segment_col,
+        *[
+            c for c in feature_catalog(dna_cfg)
+            if c in segments_df.columns
+        ],
+    ]))
+
+    cached = st.session_state.get("_dna_customer_input")
+
+    if (
+        cached is None
+        or cached["source"] is not segments_df
+        or cached["columns"] != dna_cols
+    ):
+        with st.spinner("Preparing Segment DNA input..."):
+            cached = {
+                "source": segments_df,
+                "columns": dna_cols,
+                "frame": segments_df.select(dna_cols).to_pandas(),
+            }
+            st.session_state["_dna_customer_input"] = cached
 
     render_segment_dna(
-        customers=segments_df.to_pandas(),
+        customers=cached["frame"],
         transactions=dna_transactions,
-        config=DNAConfig(currency=dna_currency),
+        config=dna_cfg,
         eligible_segments=selected,
         segment_labels=labels,
         key_prefix=f"segment_dna_{st.session_state.tx_fingerprint}",

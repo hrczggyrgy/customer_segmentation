@@ -150,7 +150,16 @@ def prepare_customers(customers: pd.DataFrame, config: DNAConfig,
         raise ValueError(f"Missing customer columns: {sorted(required - set(customers.columns))}")
     if config.trait_threshold < 0 or not np.isfinite(config.trait_threshold):
         raise ValueError("trait_threshold must be finite and nonnegative.")
-    data = customers.copy(deep=True)
+    
+    # Project to registered columns before deep-copying
+    catalog = feature_catalog(config)
+    keep = list(dict.fromkeys([
+        config.customer_col,
+        config.segment_col,
+        *[c for c in catalog if c in customers.columns],
+    ]))
+    data = customers.loc[:, keep].copy(deep=True)
+    
     data[config.customer_col] = _ids(data[config.customer_col], config.customer_col)
     if data[config.customer_col].duplicated().any():
         raise ValueError("Expected one row per customer; duplicate customer IDs found.")
@@ -202,22 +211,41 @@ def summarize_features(data: pd.DataFrame, segment: str, config: DNAConfig) -> p
     yields an undefined z difference, not a fabricated zero. Missing values are
     excluded per feature; valid sample sizes are always available in the table.
     """
-    chosen = data[data[config.segment_col].eq(str(segment))]
-    rows = []
-    for name, metadata in feature_catalog(config).items():
-        if name not in data:
-            continue
-        base, subset = data[name].dropna(), chosen[name].dropna()
-        sd = base.std(ddof=0) if len(base) else np.nan
-        mean = subset.mean()
-        z = (mean - base.mean()) / sd if np.isfinite(sd) and sd > 0 else np.nan
-        rows.append(dict(feature=name, label=metadata.label, group=metadata.group,
-                         unit=metadata.unit, definition=metadata.definition,
-                         segment_n=len(subset), base_n=len(base), segment_mean=mean,
-                         base_mean=base.mean(), segment_median=subset.median(),
-                         base_median=base.median(), segment_p25=subset.quantile(.25),
-                         segment_p75=subset.quantile(.75), base_sd=sd, z_difference=z))
-    return pd.DataFrame(rows)
+    catalog = feature_catalog(config)
+    features = [c for c in catalog if c in data.columns]
+
+    base = data[features]
+    chosen = data.loc[
+        data[config.segment_col].eq(str(segment)), features
+    ]
+    quantiles = chosen.quantile([0.25, 0.75])
+    sd = base.std(ddof=0)
+
+    out = pd.DataFrame({
+        "segment_n": chosen.count(),
+        "base_n": base.count(),
+        "segment_mean": chosen.mean(),
+        "base_mean": base.mean(),
+        "segment_median": chosen.median(),
+        "base_median": base.median(),
+        "segment_p25": quantiles.loc[0.25],
+        "segment_p75": quantiles.loc[0.75],
+        "base_sd": sd,
+    })
+
+    denominator = sd.where(np.isfinite(sd) & sd.gt(0))
+    out["z_difference"] = (
+        (out["segment_mean"] - out["base_mean"]) / denominator
+    ).replace([np.inf, -np.inf], np.nan)
+
+    out.index.name = "feature"
+    out = out.reset_index()
+
+    for field in ("label", "group", "unit", "definition"):
+        out[field] = out["feature"].map(
+            lambda name: getattr(catalog[name], field)
+        )
+    return out
 
 
 def contribution_table(data: pd.DataFrame, config: DNAConfig) -> pd.DataFrame:
@@ -243,7 +271,19 @@ def prepare_transactions(transactions: pd.DataFrame, data: pd.DataFrame,
         raise ValueError("transactions must be a DataFrame with unique columns.")
     if not required.issubset(transactions):
         raise ValueError(f"Missing transaction columns: {sorted(required - set(transactions.columns))}")
-    tx = transactions.copy(deep=True)
+    
+    # Project to registered columns before deep-copying
+    keep = [
+        config.customer_col,
+        "transaction_id",
+        "transaction_date",
+        "price",
+        "quantity",
+    ]
+    if "category" in transactions.columns:
+        keep.append("category")
+    tx = transactions.loc[:, keep].copy(deep=True)
+    
     ids = tx[config.customer_col].astype("string").str.strip()
     order_ids = tx.transaction_id.astype("string").str.strip()
     tx[config.customer_col] = ids
@@ -334,11 +374,21 @@ def render_segment_dna(customers: pd.DataFrame, *,
     select_key = f"{prefix}_segment"
     if select_key in st.session_state and st.session_state[select_key] not in options:
         del st.session_state[select_key]
-    segment = st.selectbox("Select a customer segment", options, key=select_key,
-                           format_func=lambda x: f"{labels.get(x, 'Segment ' + x)} · ID {x}")
+    segment = st.selectbox(
+        "Select a customer segment",
+        options,
+        key=select_key,
+        format_func=lambda x: f"{labels.get(x, 'Segment ' + x)} · ID {x}",
+        help=(
+            "Global filters control which segments you can select. "
+            "Means, standard deviations and share denominators "
+            "always use the full customer base."
+        ),
+    )
     subset = data[data[cfg.segment_col].eq(segment)]
-    summary = summarize_features(data, segment, cfg)
-    contribution = contribution_table(data, cfg)
+    with st.spinner("Calculating segment characteristics..."):
+        summary = summarize_features(data, segment, cfg)
+        contribution = contribution_table(data, cfg)
     row = contribution.loc[segment]
     st.subheader(labels.get(segment, f"Segment {segment}"))
     st.caption(f"{len(subset):,} customers in this segment; {len(data):,} in the full base. "
@@ -370,6 +420,27 @@ def render_segment_dna(customers: pd.DataFrame, *,
                    "Shares use known spend only and can be biased by missingness.")
     if len(subset) < 30:
         st.warning("Small segment (fewer than 30 customers): descriptive summaries may be unstable.")
+    
+    # Feature-level coverage warning
+    coverage = summary["segment_n"] / len(subset)
+    low_coverage = summary.loc[
+        coverage.lt(0.8),
+        ["label", "segment_n"],
+    ]
+    if not low_coverage.empty:
+        st.warning(
+            f"{len(low_coverage)} features have less than 80% coverage "
+            "in this segment. Interpret their differences cautiously."
+        )
+        with st.expander("Features with incomplete coverage"):
+            st.dataframe(
+                low_coverage.assign(
+                    coverage=coverage.loc[low_coverage.index]
+                ),
+                hide_index=True,
+                use_container_width=True,
+            )
+    
     if notes:
         with st.expander("Input quality notes"):
             for note in dict.fromkeys(notes):
@@ -396,51 +467,188 @@ def render_segment_dna(customers: pd.DataFrame, *,
     with overview:
         groups = summary.group.unique().tolist()
         chosen_groups = st.multiselect("Feature families", groups, default=groups, key=f"{prefix}_groups")
-        chart_data = summary[summary.group.isin(chosen_groups)].dropna(subset=["z_difference"])
+        
+        show_all = st.checkbox(
+            "Show all available features",
+            value=False,
+            key=f"{prefix}_all_features",
+            help="By default, show the eight largest differences from the full base.",
+        )
+
+        chart_data = summary.loc[
+            summary["group"].isin(chosen_groups)
+        ].dropna(subset=["z_difference"]).copy()
+
+        if not show_all:
+            chart_data = chart_data.loc[
+                chart_data["z_difference"].abs().nlargest(8).index
+            ]
+
         chart_data = chart_data.sort_values("z_difference")
-        if not chart_data.empty:
-            fig = px.bar(chart_data, x="z_difference", y="label", orientation="h",
-                         color="z_difference", color_continuous_scale="RdBu", color_continuous_midpoint=0,
-                         hover_data=["segment_mean", "base_mean", "unit", "segment_n", "base_n"],
-                         labels={"z_difference": "Mean difference / full-base SD", "label": ""},
-                         title="Segment DNA versus full-base behavior")
-            fig.add_vline(x=0, line_color="#64748b")
-            fig.update_layout(height=max(380, len(chart_data) * 27), coloraxis_showscale=False)
-            _chart(st, fig, f"{prefix}_dna_bar")
-        else:
-            st.info("No nonconstant, observed features in these families.")
-        st.caption("Raw arithmetic means and full-base population SD; no winsorization or log transform. "
-                   "A constant feature has no defined standardized difference. Missing values are excluded per feature.")
-        st.dataframe(summary[["label", "segment_n", "base_n", "segment_mean", "base_mean",
-                              "segment_median", "segment_p25", "segment_p75", "z_difference"]],
-                     use_container_width=True, hide_index=True)
+
+        chart_col, guide_col = st.columns([3, 1])
+
+        with chart_col:
+            if chart_data.empty:
+                st.info("Select a feature family with observed, nonconstant features.")
+            else:
+                limit = max(0.5, float(chart_data["z_difference"].abs().max()))
+                fig = px.bar(
+                    chart_data,
+                    x="z_difference",
+                    y="label",
+                    orientation="h",
+                    color="z_difference",
+                    color_continuous_scale="RdBu",
+                    range_color=(-limit, limit),
+                    hover_data=[
+                        "segment_mean", "base_mean", "unit", "segment_n", "base_n"
+                    ],
+                    labels={"z_difference": "Difference from full base (SD)", "label": ""},
+                )
+                fig.add_vline(x=0, line_color="#64748b")
+                fig.update_layout(
+                    height=max(360, 32 * len(chart_data)),
+                    coloraxis_showscale=False,
+                )
+                _chart(st, fig, f"{prefix}_dna_bar")
+
+        with guide_col:
+            st.info(
+                "Read the profile\n\n"
+                "• Right: higher than the full-base mean.\n"
+                "• Left: lower than the full-base mean.\n"
+                "• Zero: equal to the full-base mean.\n\n"
+                "Differences describe behavior—not causes or segment quality."
+            )
+
+        with st.expander("Exact values, quartiles and valid sample sizes"):
+            st.dataframe(
+                summary[[
+                    "label", "segment_n", "base_n",
+                    "segment_mean", "base_mean",
+                    "segment_median", "segment_p25",
+                    "segment_p75", "z_difference",
+                ]],
+                hide_index=True,
+                use_container_width=True,
+            )
+        
         st.download_button("Download aggregate DNA (CSV)", summary.to_csv(index=False).encode("utf-8"),
                            file_name="segment_dna_summary.csv", mime="text/csv", key=f"{prefix}_export")
 
+        # Optional cluster-comparison heatmap
+        if st.checkbox(
+            "Compare eligible segments",
+            key=f"{prefix}_compare_segments",
+            help="Each cell compares a segment mean with the same full-base benchmark.",
+        ):
+            features = summary.loc[
+                summary["group"].isin(chosen_groups), "feature"
+            ].tolist()
+
+            if not features:
+                st.info("Select at least one feature family.")
+            else:
+                base_sd = data[features].std(ddof=0)
+                base_sd = base_sd.where(np.isfinite(base_sd) & base_sd.gt(0))
+
+                means = data.groupby(
+                    cfg.segment_col, observed=True, sort=False
+                )[features].mean().reindex(options)
+
+                z = means.sub(data[features].mean()).div(base_sd).dropna(
+                    axis=1, how="all"
+                )
+
+                if z.empty:
+                    st.info("No observed, nonconstant features to compare.")
+                else:
+                    catalog = feature_catalog(cfg)
+                    fig = go.Figure(go.Heatmap(
+                        z=z.to_numpy(),
+                        x=[catalog[c].label for c in z.columns],
+                        y=[f"{labels.get(s, 'Segment ' + s)} · ID {s}" for s in z.index],
+                        colorscale="RdBu",
+                        zmid=0,
+                        hoverongaps=False,
+                        colorbar=dict(title="Base SD"),
+                    ))
+                    fig.update_layout(
+                        height=max(320, 45 * len(z)),
+                        xaxis=dict(tickangle=-45),
+                    )
+                    _chart(st, fig, f"{prefix}_comparison_heatmap")
+
     with behavior:
         available = summary.loc[summary.segment_n.gt(0), "feature"].tolist()
-        if available:
-            metric = st.selectbox("Feature to inspect", available, key=f"{prefix}_distribution_metric",
-                                  format_func=lambda x: feature_catalog(cfg)[x].label)
-            meta = feature_catalog(cfg)[metric]
-            log_axis = st.checkbox("Logarithmic value axis", key=f"{prefix}_log")
-            distribution = pd.DataFrame({"value": data[metric], "comparison": np.where(
-                data[cfg.segment_col].eq(segment), "Selected segment", "Other customers")}).dropna()
-            if log_axis:
-                omitted = int(distribution.value.le(0).sum())
-                distribution = distribution[distribution.value.gt(0)]
-                st.caption(f"{omitted:,} non-positive observations omitted from the chart only; summary statistics keep them.")
-            if not distribution.empty:
-                fig = px.box(distribution, x="comparison", y="value", color="comparison", points=False,
-                             log_y=log_axis, labels={"value": f"{meta.label} ({cfg.currency if meta.unit == 'money' else meta.unit})",
+        
+        metric_key = f"{prefix}_distribution_metric"
+
+        if (
+            metric_key in st.session_state
+            and st.session_state[metric_key] not in available
+        ):
+            del st.session_state[metric_key]
+
+        inspect_distribution = st.checkbox(
+            "Load within-segment distribution",
+            key=f"{prefix}_load_distribution",
+            help="Loads the customer-level boxplot and detailed statistics.",
+        )
+        
+        if inspect_distribution:
+            if available:
+                metric = st.selectbox(
+                    "Feature to inspect",
+                    available,
+                    key=metric_key,
+                    format_func=lambda x: feature_catalog(cfg)[x].label,
+                    help="Compare this segment with customers outside it.",
+                )
+                meta = feature_catalog(cfg)[metric]
+                log_axis = st.checkbox("Logarithmic value axis", key=f"{prefix}_log")
+                distribution = pd.DataFrame({"value": data[metric], "comparison": np.where(
+                    data[cfg.segment_col].eq(segment), "Selected segment", "Other customers")}).dropna()
+                if log_axis:
+                    omitted = int(distribution.value.le(0).sum())
+                    distribution = distribution[distribution.value.gt(0)]
+                    st.caption(f"{omitted:,} non-positive observations omitted from the chart only; summary statistics keep them.")
+                if distribution.empty:
+                    st.info(
+                        "No values remain for this chart. "
+                        "Disable the logarithmic axis or choose another feature."
+                    )
+                else:
+                    counts = distribution["comparison"].value_counts()
+                    if counts.get("Other customers", 0) == 0:
+                        st.info(
+                            "No observed values remain outside this segment; "
+                            "the chart shows the selected segment only."
+                        )
+                    fig = px.box(distribution, x="comparison", y="value", color="comparison", points=False,
+                                 log_y=log_axis, labels={"value": f"{meta.label} ({cfg.currency if meta.unit == 'money' else meta.unit})",
                                                    "comparison": ""},
-                             title="Selected segment versus non-overlapping remainder")
-                _chart(st, fig, f"{prefix}_distribution")
-            stats = data.assign(comparison=np.where(data[cfg.segment_col].eq(segment),
-                                                    "Selected segment", "Other customers"))
-            st.dataframe(stats.groupby("comparison")[metric].agg(["count", "mean", "median", "std", "min", "max"]),
-                         use_container_width=True)
-            st.caption(meta.definition + " Boxplot compares disjoint groups; the DNA benchmark includes the entire base. Table std uses sample SD.")
+                                 title="Selected segment versus non-overlapping remainder")
+                    _chart(st, fig, f"{prefix}_distribution")
+                # Narrow temporary frame for distribution statistics
+                stats = data[[metric]].copy()
+                stats["comparison"] = np.where(
+                    data[cfg.segment_col].eq(segment),
+                    "Selected segment",
+                    "Other customers",
+                )
+                st.dataframe(
+                    stats.groupby("comparison", sort=False)[metric].agg(
+                        ["count", "mean", "median", "std", "min", "max"]
+                    ),
+                    use_container_width=True,
+                )
+                st.caption(meta.definition + " Boxplot compares disjoint groups; the DNA benchmark includes the entire base. Table std uses sample SD.")
+            else:
+                st.info("This segment has no observed feature values to inspect.")
+        else:
+            st.info("Enable this option to inspect customer-level variation.")
 
     with economics_tab:
         shares = contribution.reset_index()
