@@ -380,6 +380,14 @@ elif st.session_state.tx_df is None:
     )
     demo_path = demo_files[selected_demo]
     
+    import os
+    if not os.path.exists(demo_path):
+        st.sidebar.error(f"Demo file not found: {demo_path}")
+        st.sidebar.caption(f"Working dir: {os.getcwd()}")
+        st.sidebar.caption(f"Files in sample_data/: {os.listdir('sample_data') if os.path.exists('sample_data') else 'N/A'}")
+        st.info("Upload cleaned transactions from the sidebar to begin.")
+        st.stop()
+    
     try:
         raw_df = pl.read_parquet(demo_path)
         new_tx_df, dropped_rows = validate_transactions(raw_df)
@@ -389,15 +397,8 @@ elif st.session_state.tx_df is None:
             st.sidebar.warning(
                 f"{dropped_rows:,} invalid transaction rows were excluded from the demo file."
             )
-    except FileNotFoundError:
-        st.sidebar.error(f"Demo file not found: {demo_path}")
-        st.info("Upload cleaned transactions from the sidebar to begin.")
-        st.stop()
-    except Exception:
-        st.sidebar.error(
-            "The demo file could not be processed. Check that it is a "
-            "readable Parquet file with the required columns and valid data."
-        )
+    except Exception as e:
+        st.sidebar.error(f"Demo file error: {type(e).__name__}: {e}")
         st.stop()
 
 tx_df = st.session_state.tx_df
