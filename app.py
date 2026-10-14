@@ -507,16 +507,23 @@ with tab_dna:
     dna_transactions = None
 
     if show_purchase_details:
-        dna_transactions = tx_df.select(
-            [
-                "customer_id",
-                "transaction_id",
-                "transaction_date",
-                "price",
-                "quantity",
-                "category",
-            ]
-        ).to_pandas()
+        # Debug: show available columns
+        st.caption(f"Available columns in tx_df: {tx_df.columns}")
+        try:
+            dna_transactions = tx_df.select(
+                [
+                    "customer_id",
+                    "transaction_id",
+                    "transaction_date",
+                    "price",
+                    "quantity",
+                    "category",
+                ]
+            ).to_pandas()
+            st.caption(f"Transaction rows: {len(dna_transactions)}")
+        except Exception as e:
+            st.error(f"Failed to select transaction columns: {e}")
+            dna_transactions = None
 
     render_segment_dna(
         customers=segments_df.to_pandas(),
