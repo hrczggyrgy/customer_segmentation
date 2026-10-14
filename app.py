@@ -151,6 +151,10 @@ def validate_transactions(df: pl.DataFrame) -> tuple[pl.DataFrame, int]:
     if df.is_empty():
         raise ValueError("The uploaded dataset contains no rows.")
 
+    # Handle transaction_date conversion - may already be datetime or string
+    if df["transaction_date"].dtype not in (pl.Datetime, pl.Date):
+        df = df.with_columns(pl.col("transaction_date").str.to_datetime(strict=False))
+
     df = df.with_columns([
         pl.col("customer_id").cast(pl.String, strict=False).str.strip_chars(),
         pl.col("transaction_id").cast(pl.String, strict=False).str.strip_chars(),
@@ -161,7 +165,6 @@ def validate_transactions(df: pl.DataFrame) -> tuple[pl.DataFrame, int]:
             .cast(pl.String, strict=False).fill_null("__UNKNOWN__"),
         pl.col("category")
             .cast(pl.String, strict=False).fill_null("__UNKNOWN__"),
-        pl.col("transaction_date").str.to_datetime(strict=False),
         pl.col("price").cast(pl.Float64, strict=False),
         pl.col("quantity").cast(pl.Float64, strict=False),
     ])

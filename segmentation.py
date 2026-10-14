@@ -41,13 +41,22 @@ class AdvancedCustomerSegmentation:
         
         df_cleaned = lazy_df.with_columns(str_exprs)
 
+        # Handle transaction_date - may already be datetime
+        tx_date_expr = []
+        if 'transaction_date' in df_cleaned.collect_schema().names():
+            dtype = df_cleaned.collect_schema()['transaction_date']
+            if dtype not in (pl.Datetime, pl.Date):
+                tx_date_expr.append(pl.col('transaction_date').str.to_datetime(strict=False).alias('transaction_date'))
+            else:
+                tx_date_expr.append(pl.col('transaction_date'))
+        
         df_cleaned = df_cleaned.with_columns([
             pl.col('product_description').fill_null(""),
             pl.when(pl.col('department').is_null() | (pl.col('department') == ""))
               .then(pl.lit("__UNKNOWN__")).otherwise(pl.col('department')).alias('department'),
             pl.when(pl.col('category').is_null() | (pl.col('category') == ""))
               .then(pl.lit("__UNKNOWN__")).otherwise(pl.col('category')).alias('category'),
-            pl.col('transaction_date').str.to_datetime(strict=False),
+            *tx_date_expr,
             pl.col('price').cast(pl.Float64, strict=False),
             pl.col('quantity').cast(pl.Float64, strict=False)
         ])
