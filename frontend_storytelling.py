@@ -11,6 +11,58 @@ METRICS = {
 REQUIRED = {"customer_id", "Cluster", "Total_Lifetime_Spend", "Average_Order_Value_AOV",
             "Recency_Days", "Average_InterPurchase_Time_AIPT", "Churn_Risk_Index_CRI"}
 
+# Feature-specific wording, based on the definitions in segmentation.py.
+# 'format' renders raw averages with units; 'definition' says how the feature is built;
+# 'above'/'below' describe the direction without implying better or worse performance.
+METRIC_NARRATIVES = {
+    'Total_Lifetime_Spend': dict(
+        format='${:,.2f}',
+        definition='Sum of quantity x price over observed purchase lines.',
+        above='Higher historical spend in the observed period; not predicted lifetime value.',
+        below='Lower historical spend in the observed period; not predicted lifetime value.'),
+    'Average_Order_Value_AOV': dict(
+        format='${:,.2f}',
+        definition='Observed spend divided by distinct transaction IDs.',
+        above='Larger average spend per transaction.',
+        below='Smaller average spend per transaction.'),
+    'Recency_Days': dict(
+        format='{:,.1f} days',
+        definition='Days from the last observed purchase to the day after the latest date in the data.',
+        above='Longer since the last observed purchase; a timing description, not a verdict on loyalty.',
+        below='More recent last observed purchase.'),
+    'Total_Lifetime_Transactions': dict(
+        format='{:,.2f} transactions',
+        definition='Distinct transaction IDs observed per customer.',
+        above='More distinct transactions in the observed period.',
+        below='Fewer distinct transactions in the observed period.'),
+    'Category_Width': dict(
+        format='{:,.2f} categories',
+        definition='Distinct product categories purchased.',
+        above='Purchases span more product categories.',
+        below='Purchases are concentrated in fewer product categories.'),
+    'Average_InterPurchase_Time_AIPT': dict(
+        format='{:,.1f} days',
+        definition='Mean gap between distinct purchase dates; zero with fewer than two purchase dates.',
+        above='Longer gaps between purchase dates.',
+        below='Shorter gaps between purchase dates, or zeros from single-date customers; check repeat-history coverage.'),
+    'Churn_Risk_Index_CRI': dict(
+        format='{:,.2f}x',
+        definition='Recency divided by average purchase interval when that interval is positive; otherwise zero.',
+        above='Recency is large relative to typical purchase gaps; a descriptive delay ratio, not a churn probability.',
+        below='Lower delay ratio; zero for single-date customers does not indicate healthy behavior.'),
+    'Inferred_Discount_Affinity': dict(
+        format='{:,.3f} lines/unit',
+        definition='Lines priced below 80% of the SKU maximum observed price, divided by purchased units.',
+        above='More below-80%-of-maximum-price lines per unit; not a discount percentage or share of transactions.',
+        below='Fewer below-80%-of-maximum-price lines per unit; not a discount percentage or share of transactions.'),
+}
+
+
+def format_metric_value(metric, value):
+    """Format a raw average with its unit."""
+    spec = METRIC_NARRATIVES.get(metric)
+    return spec['format'].format(value) if spec else f'{value:,.2f}'
+
 
 def prepare_customers(frame):
     missing = REQUIRED.difference(frame.columns)
@@ -89,12 +141,6 @@ def segment_differentiators(customers, cluster_order, max_traits=3, min_abs_z=0.
         raise ValueError('min_abs_z must be finite and non-negative.')
     metrics, z, custom = profile_matrix(customers, cluster_order)
     stds = customers[metrics].std()
-    contexts = {
-        'Recency_Days': ('Longer since the last purchase.', 'More recent last purchase.'),
-        'Average_InterPurchase_Time_AIPT': ('Longer purchase intervals.', 'Shorter purchase intervals; check repeat-history coverage.'),
-        'Churn_Risk_Index_CRI': ('More delay relative to purchase cadence.', 'Lower measured delay; insufficient history can also yield zero.'),
-        'Total_Lifetime_Spend': ('Higher historical observed spend, not predicted lifetime value.', 'Lower historical observed spend, not predicted lifetime value.'),
-    }
     result = {}
     for i, cluster in enumerate(z.index):
         eligible = {}
@@ -110,9 +156,11 @@ def segment_differentiators(customers, cluster_order, max_traits=3, min_abs_z=0.
             j = metrics.index(metric)
             raw, overall, score = custom[i, j]
             direction = 'above' if score > 0 else 'below'
-            context = contexts.get(metric, ('', ''))[0 if score > 0 else 1]
+            spec = METRIC_NARRATIVES.get(metric, {})
+            context = spec.get('above' if score > 0 else 'below', '')
             traits.append(dict(metric=metric, label=METRICS[metric], z_score=float(score),
-                direction=direction, segment_mean=float(raw), overall_mean=float(overall), context=context))
+                direction=direction, segment_mean=float(raw), overall_mean=float(overall),
+                context=context, definition=spec.get('definition', '')))
         result[cluster] = traits
     return result
 
@@ -145,6 +193,14 @@ def render_contribution(profiles, selected, colors):
     st.caption('Leading segment = highest observed-spend share among selected segments. Denominators use the full base. Index = spend share / customer share; gap = spend share − customer share in percentage points, not change over time. Observed spend is historical, not predicted lifetime value. Undefined spend-share bars display zero.')
 
 
+def _card():
+    import streamlit as st
+    try:
+        return st.container(border=True)
+    except TypeError:
+        return st.container()
+
+
 def render_profiles(customers, profiles, selected):
     import plotly.express as px
     import streamlit as st
@@ -163,16 +219,17 @@ def render_profiles(customers, profiles, selected):
     columns = st.columns(2)
     for i, (cluster, row) in enumerate(visible.iterrows()):
         with columns[i % 2]:
-            st.write(row['label'])
-            traits = differentiators[cluster]
-            if not traits:
-                st.caption('No eligible differences at or above 0.25 full-base standard deviations.')
-            for trait in traits:
-                money = trait['metric'] in ('Total_Lifetime_Spend', 'Average_Order_Value_AOV')
-                prefix = '$' if money else ''
-                st.caption(f"{trait['label']}: {abs(trait['z_score']):.2f} SD {trait['direction']} the full-base average. "
-                    f"Segment mean {prefix}{trait['segment_mean']:,.2f}; base mean {prefix}{trait['overall_mean']:,.2f}. {trait['context']}")
-    st.caption('Up to three traits ranked by absolute standardized difference; 0.25 SD is a display threshold, not statistical significance. Correlated traits are not independent evidence. Cadence/delay metrics include zeros for insufficient repeat history; inspect the repeat-history fraction below.')
+            with _card():
+                st.markdown(f"**{row['label']}**")
+                traits = differentiators[cluster]
+                if not traits:
+                    st.caption('No eligible differences at or above 0.25 full-base standard deviations.')
+                for trait in traits:
+                    arrow = '▲' if trait['direction'] == 'above' else '▼'
+                    st.markdown(f"{arrow} **{trait['label']}** · {abs(trait['z_score']):.2f} SD {trait['direction']} the full-base average")
+                    st.caption(f"Segment mean {format_metric_value(trait['metric'], trait['segment_mean'])} vs. full-base mean "
+                        f"{format_metric_value(trait['metric'], trait['overall_mean'])}. {trait['context']} Definition: {trait['definition']}")
+    st.caption('Up to three traits ranked by absolute standardized difference; 0.25 SD is a display threshold, not statistical significance. Differences are descriptive, not causal or proof of better performance. Correlated traits are not independent evidence. Cadence/delay metrics include zeros for insufficient repeat history; inspect the repeat-history fraction below.')
     summary = visible[['label', 'customers', 'median_spend', 'median_delay', 'repeat_share', 'action_hypothesis']].reset_index(drop=True)
     st.dataframe(summary, use_container_width=True, column_config={
         'label': 'Segment', 'customers': 'Customers',
