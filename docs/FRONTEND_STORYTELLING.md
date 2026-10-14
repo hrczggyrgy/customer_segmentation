@@ -29,3 +29,31 @@ synthetic data; Polars integration tests are skipped if Polars is unavailable.
 A real browser smoke test remains required: upload, force regenerate, switch
 datasets, use independent sessions, verify selected IDs and PCA metadata, and
 compare finalized retention with source-confirmed complete months.
+
+## Contribution index and segment differentiators
+
+The leading segment is the one with highest observed-spend share among the
+selected segments; shares always retain full-base denominators. Its contribution
+index is spend share divided by customer share. A 35% spend share and 20% customer
+share give 1.75x. The share gap is 35 - 20 = +15 percentage points, not a time
+change or relative percentage increase. Cards display N/A for a zero customer
+share, non-positive total base spend, or invalid/non-finite input. Zero spend
+share is valid when total base spend and customer share are positive.
+
+Below the profile heatmap, each segment shows up to three differentiators ranked
+by absolute (segment mean - full-base mean) / full-base standard deviation.
+Constant metrics, missing/non-finite means, zero differences, and differences
+below 0.25 standard deviations are omitted. The 0.25 threshold controls display
+noise; it is not a statistical significance threshold. Ties follow metric order.
+Changing selected segments does not recalculate the full-base benchmark.
+
+Narratives include direction and raw averages. Higher recency means longer since
+the last purchase, not better performance. Cadence and delay features include
+zeros for insufficient repeat history; consult the repeat-history fraction.
+Correlated traits are not independent evidence, and these summaries do not
+establish causality, churn probability, or predicted lifetime value.
+
+Focused tests: `python -m unittest discover -s tests -p 'test_storytelling_insights.py' -v`
+Rendering tests construct Plotly figures with a mocked Streamlit interface;
+they are not browser tests. Check card values and narratives under filtering,
+zero-spend datasets, and constant metrics before deployment.

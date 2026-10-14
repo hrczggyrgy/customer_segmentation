@@ -68,6 +68,55 @@ def selected_customer_ids(points):
             if point.get('customdata') is not None and len(point['customdata']) > 0}
 
 
+def contribution_metrics(customer_share, spend_share, total_spend):
+    """Return spend/customer-share ratio and percentage-point gap, or N/A values."""
+    try:
+        customer_share, spend_share, total_spend = map(float, (customer_share, spend_share, total_spend))
+    except (TypeError, ValueError):
+        return None, None
+    if (not np.isfinite([customer_share, spend_share, total_spend]).all()
+            or customer_share <= 0 or spend_share < 0 or total_spend <= 0):
+        return None, None
+    ratio, gap = spend_share / customer_share, spend_share - customer_share
+    return (ratio, gap) if np.isfinite([ratio, gap]).all() else (None, None)
+
+
+def segment_differentiators(customers, cluster_order, max_traits=3, min_abs_z=0.25):
+    """Rank descriptive full-base standardized differences; not significance tests."""
+    if not isinstance(max_traits, int) or max_traits < 1:
+        raise ValueError('max_traits must be a positive integer.')
+    if not np.isfinite(min_abs_z) or min_abs_z < 0:
+        raise ValueError('min_abs_z must be finite and non-negative.')
+    metrics, z, custom = profile_matrix(customers, cluster_order)
+    stds = customers[metrics].std()
+    contexts = {
+        'Recency_Days': ('Longer since the last purchase.', 'More recent last purchase.'),
+        'Average_InterPurchase_Time_AIPT': ('Longer purchase intervals.', 'Shorter purchase intervals; check repeat-history coverage.'),
+        'Churn_Risk_Index_CRI': ('More delay relative to purchase cadence.', 'Lower measured delay; insufficient history can also yield zero.'),
+        'Total_Lifetime_Spend': ('Higher historical observed spend, not predicted lifetime value.', 'Lower historical observed spend, not predicted lifetime value.'),
+    }
+    result = {}
+    for i, cluster in enumerate(z.index):
+        eligible = {}
+        for j, metric in enumerate(metrics):
+            raw, overall, score = custom[i, j]
+            std = stds[metric]
+            if (np.isfinite([raw, overall, score, std]).all() and std > 0
+                    and score != 0 and abs(score) >= min_abs_z):
+                eligible[metric] = score
+        ranking = pd.Series(eligible, dtype=float).abs().nlargest(max_traits)
+        traits = []
+        for metric in ranking.index:
+            j = metrics.index(metric)
+            raw, overall, score = custom[i, j]
+            direction = 'above' if score > 0 else 'below'
+            context = contexts.get(metric, ('', ''))[0 if score > 0 else 1]
+            traits.append(dict(metric=metric, label=METRICS[metric], z_score=float(score),
+                direction=direction, segment_mean=float(raw), overall_mean=float(overall), context=context))
+        result[cluster] = traits
+    return result
+
+
 def render_contribution(profiles, selected, colors):
     import plotly.express as px
     import streamlit as st
@@ -85,8 +134,15 @@ def render_contribution(profiles, selected, colors):
         with column:
             st.plotly_chart(fig, use_container_width=True)
     leader = visible.sort_values('spend_share', ascending=False).iloc[0]
-    st.info(f"{leader['label']} represents {leader['customer_share']:.1f}% of customers and {leader['spend_share']:.1f}% of observed spend.")
-    st.caption('Full-base denominators; observed spend is historical, not predicted lifetime value. Spend shares are undefined for a non-positive base total; bars then display zero.')
+    ratio, gap = contribution_metrics(leader['customer_share'], leader['spend_share'], profiles['spend'].sum())
+    if ratio is None:
+        st.info('Observed-spend contribution is unavailable: a positive base spend and customer share are required.')
+    else:
+        st.info(f"{leader['label']} represents {leader['customer_share']:.1f}% of customers and {leader['spend_share']:.1f}% of observed spend.")
+    ratio_col, gap_col = st.columns(2)
+    ratio_col.metric('Spend contribution index', f'{ratio:.2f}×' if ratio is not None else 'N/A')
+    gap_col.metric('Gap vs. customer share', f'{gap:+.1f} pp' if gap is not None else 'N/A')
+    st.caption('Leading segment = highest observed-spend share among selected segments. Denominators use the full base. Index = spend share / customer share; gap = spend share − customer share in percentage points, not change over time. Observed spend is historical, not predicted lifetime value. Undefined spend-share bars display zero.')
 
 
 def render_profiles(customers, profiles, selected):
@@ -102,6 +158,21 @@ def render_profiles(customers, profiles, selected):
     fig.update_layout(height=max(400, len(visible) * 55), coloraxis_colorbar_title='Std. difference')
     st.plotly_chart(fig, use_container_width=True)
     st.caption('Red means above average, not necessarily better: higher recency and delay can signal overdue purchases. Values are (segment mean − full-base mean) / full-base standard deviation. Colors saturate at ±3; constant metrics display zero.')
+    st.subheader('What distinguishes these segments?')
+    differentiators = segment_differentiators(customers, visible.index.tolist())
+    columns = st.columns(2)
+    for i, (cluster, row) in enumerate(visible.iterrows()):
+        with columns[i % 2]:
+            st.write(row['label'])
+            traits = differentiators[cluster]
+            if not traits:
+                st.caption('No eligible differences at or above 0.25 full-base standard deviations.')
+            for trait in traits:
+                money = trait['metric'] in ('Total_Lifetime_Spend', 'Average_Order_Value_AOV')
+                prefix = '$' if money else ''
+                st.caption(f"{trait['label']}: {abs(trait['z_score']):.2f} SD {trait['direction']} the full-base average. "
+                    f"Segment mean {prefix}{trait['segment_mean']:,.2f}; base mean {prefix}{trait['overall_mean']:,.2f}. {trait['context']}")
+    st.caption('Up to three traits ranked by absolute standardized difference; 0.25 SD is a display threshold, not statistical significance. Correlated traits are not independent evidence. Cadence/delay metrics include zeros for insufficient repeat history; inspect the repeat-history fraction below.')
     summary = visible[['label', 'customers', 'median_spend', 'median_delay', 'repeat_share', 'action_hypothesis']].reset_index(drop=True)
     st.dataframe(summary, use_container_width=True, column_config={
         'label': 'Segment', 'customers': 'Customers',
