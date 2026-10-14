@@ -73,8 +73,6 @@ def prepare_transactions(transactions: pl.DataFrame | pd.DataFrame) -> pd.DataFr
     Accepts either Polars or pandas DataFrame. Returns pandas DataFrame.
     """
     transactions = _to_pandas(transactions)
-    if not isinstance(transactions, pd.DataFrame):
-        raise TypeError("transactions must be a pandas or Polars DataFrame.")
     missing = REQUIRED_COLUMNS.difference(transactions.columns)
     if missing:
         raise ValueError("Missing required transaction columns: " + ", ".join(sorted(missing)))
