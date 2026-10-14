@@ -113,60 +113,6 @@ def prepare_transactions(transactions: pl.DataFrame | pd.DataFrame) -> pd.DataFr
     return data.sort_values(["order_date", "customer_id", "transaction_id"]).reset_index(drop=True)
 
 
-def _normalise_date(value: Any) -> pd.Timestamp:
-    """Return a timezone-naive, normalized timestamp (midnight)."""
-    parsed = pd.to_datetime(value, errors="coerce", utc=True)
-    if pd.isna(parsed):
-        raise ValueError("Could not interpret the supplied date.")
-    return pd.Timestamp(parsed).tz_convert(None).normalize()
-
-
-def prepare_transactions(transactions: pl.DataFrame | pd.DataFrame) -> pd.DataFrame:
-    """Validate and prepare transaction lines without using future-derived metrics.
-
-    Accepts either Polars or pandas DataFrame. Returns pandas DataFrame.
-    """
-    transactions = _to_pandas(transactions)
-    missing = REQUIRED_COLUMNS.difference(transactions.columns)
-    if missing:
-        raise ValueError("Missing required transaction columns: " + ", ".join(sorted(missing)))
-
-    data = transactions.copy()
-    data = data.loc[data["customer_id"].notna() & data["transaction_id"].notna()].copy()
-    data["customer_id"] = data["customer_id"].astype(str).str.strip()
-    data["transaction_id"] = data["transaction_id"].astype(str).str.strip()
-    data = data.loc[data["customer_id"].ne("") & data["transaction_id"].ne("")].copy()
-
-    data["order_date"] = (
-        pd.to_datetime(data["transaction_date"], errors="coerce", utc=True)
-        .dt.tz_convert(None)
-        .dt.normalize()
-    )
-    data["price"] = pd.to_numeric(data["price"], errors="coerce")
-    data["quantity"] = pd.to_numeric(data["quantity"], errors="coerce")
-    numeric_ok = (
-        np.isfinite(data["price"].to_numpy(dtype=float, na_value=np.nan))
-        & np.isfinite(data["quantity"].to_numpy(dtype=float, na_value=np.nan))
-    )
-    data = data.loc[
-        data["order_date"].notna()
-        & numeric_ok
-        & data["price"].ge(0)
-        & data["quantity"].gt(0)
-    ].copy()
-    if data.empty:
-        raise ValueError("No valid transaction lines remain after checking IDs, dates, prices, and quantities.")
-
-    if "category" not in data.columns:
-        data["category"] = "__UNKNOWN__"
-    else:
-        data["category"] = data["category"].fillna("__UNKNOWN__").astype(str).str.strip()
-        data.loc[data["category"].eq(""), "category"] = "__UNKNOWN__"
-
-    data["line_spend"] = data["price"] * data["quantity"]
-    return data.sort_values(["order_date", "customer_id", "transaction_id"]).reset_index(drop=True)
-
-
 def _aggregate_window(
     lines: pd.DataFrame,
     start: pd.Timestamp | None,

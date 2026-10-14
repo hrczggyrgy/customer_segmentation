@@ -5,6 +5,16 @@ and Plotly. The app connects behavioral segmentation to business-oriented
 comparisons and customer-level exploration. It is not a production-security
 certification, and full browser validation with the actual datasets remains required.
 
+## Demo
+
+- **Live application:** <https://customer-segmentation-v1.streamlit.app/>
+- **Source code:** This repository
+
+![Customer analytics dashboard](docs/screenshots/dashboard.png)
+
+> **To complete this section:**
+> 1. Screenshot: Run `streamlit run app.py`, open in browser, capture screenshot → save as `docs/screenshots/dashboard.png`
+
 ## Architecture
 
 ```text
@@ -126,14 +136,19 @@ flowchart TB
   cohort starting customer counts in row labels, and hover details (cohort, month,
   retention %, retained customers).
 
-## Observed behavior, hypotheses, and predictions
+## Modeling scope and interpretation
 
-Observed behavior is what the uploaded transactions show (spend, recency,
-cadence, retention). Segment labels and action hypotheses are ideas to test, not
-validated recommendations. The dashboard makes no predictions: historical spend is
-not predicted lifetime value, and purchase delay is not a calibrated churn
-probability. Cluster IDs, cluster counts, and descriptive labels may change with
-the dataset. Previous example results are dataset-specific, not guaranteed outcomes.
+The customer segmentation workflow is descriptive. Historical
+spend and purchase delay are not predicted lifetime value or
+calibrated churn probabilities.
+
+The separate Purchase Inactivity tab fits an explainable
+Logistic Regression baseline to estimate the probability of
+no purchase in the next 30 days for currently active customers.
+
+The model is evaluated using time-based holdout data. Treat
+the resulting scores as estimates for customer ranking, not
+guaranteed outcomes or validated causal explanations.
 
 ## Data identity and deployment behavior
 

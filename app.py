@@ -7,7 +7,8 @@ import plotly.io as pio
 import numpy as np
 import io
 import hashlib
-from datetime import timedelta
+import logging
+from datetime import date, timedelta
 from segmentation import AdvancedCustomerSegmentation
 from data_safety import source_fingerprint, generate_session_segments, finalized_month_end, month_end, retention_matrix
 from frontend_storytelling import (
@@ -22,6 +23,8 @@ from purchase_inactivity import (
     global_feature_effects,
     prepare_transactions as prepare_inactivity_transactions,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---- Plotly brand template ----
 BRAND_TEMPLATE = go.layout.Template(
@@ -50,9 +53,12 @@ BRAND_TEMPLATE = go.layout.Template(
 pio.templates["brand"] = BRAND_TEMPLATE
 pio.templates.default = "brand"
 
-st.set_page_config(page_title="Advanced Customer Analytics", layout="wide")
-st.title("Customer Intelligence Platform")
-st.caption("Understand segment value, compare behavior, and explore customer-level action hypotheses.")
+st.set_page_config(page_title="Customer Segmentation", layout="wide")
+st.title("Customer Segmentation")
+st.caption(
+    "Explore customer value, purchasing behavior, retention, "
+    "and estimated purchase inactivity."
+)
 
 for key, default in {
     "segments_df": None, "tx_df": None, "segments_generated": False,
@@ -97,6 +103,85 @@ def pc_axis_label(pc, variance):
     return f'{pc} ({variance[pc]:.1%} of variance)' if pc in variance else pc
 
 
+# ---- Risk palette ----
+RISK_COLORS = {
+    "Low (<20%)": "#287D70",
+    "Medium (20-50%)": "#D97706",
+    "High (50-80%)": "#C2413B",
+    "Very High (>80%)": "#991B1B",
+}
+
+
+# ---- Required transaction columns for validation ----
+REQUIRED_TX_COLUMNS = {
+    "customer_id", "transaction_id", "product_id",
+    "product_description", "department", "category",
+    "transaction_date", "price", "quantity",
+}
+
+
+def validate_transactions(df: pl.DataFrame) -> tuple[pl.DataFrame, int]:
+    """Validate and clean uploaded transaction Parquet.
+    
+    Returns cleaned DataFrame and count of dropped rows.
+    """
+    missing = REQUIRED_TX_COLUMNS.difference(df.columns)
+    if missing:
+        raise ValueError(
+            "Missing required columns: " + ", ".join(sorted(missing))
+        )
+    if df.is_empty():
+        raise ValueError("The uploaded dataset contains no rows.")
+
+    df = df.with_columns([
+        pl.col("customer_id").cast(pl.String, strict=False).str.strip_chars(),
+        pl.col("transaction_id").cast(pl.String, strict=False).str.strip_chars(),
+        pl.col("product_id").cast(pl.String, strict=False).str.strip_chars(),
+        pl.col("product_description")
+            .cast(pl.String, strict=False).fill_null(""),
+        pl.col("department")
+            .cast(pl.String, strict=False).fill_null("__UNKNOWN__"),
+        pl.col("category")
+            .cast(pl.String, strict=False).fill_null("__UNKNOWN__"),
+        pl.col("transaction_date").cast(pl.Datetime, strict=False),
+        pl.col("price").cast(pl.Float64, strict=False),
+        pl.col("quantity").cast(pl.Float64, strict=False),
+    ])
+
+    valid = (
+        pl.col("customer_id").is_not_null() & (pl.col("customer_id") != "") &
+        pl.col("transaction_id").is_not_null() & (pl.col("transaction_id") != "") &
+        pl.col("product_id").is_not_null() & (pl.col("product_id") != "") &
+        pl.col("transaction_date").is_not_null() &
+        pl.col("price").is_finite() & (pl.col("price") >= 0) &
+        pl.col("quantity").is_finite() & (pl.col("quantity") > 0)
+    )
+    cleaned = df.filter(valid)
+    dropped_rows = df.height - cleaned.height
+    if cleaned.is_empty():
+        raise ValueError(
+            "No valid transaction rows remain after validation."
+        )
+    return cleaned, dropped_rows
+
+
+def reset_inactivity_state():
+    """Clear all inactivity-model session state when the source dataset changes."""
+    keys = (
+        "inactivity_prepared_tx",
+        "inactivity_prepared_tx_fingerprint",
+        "inactivity_file_fingerprint",
+        "inactivity_result",
+        "inactivity_run_key",
+        "inactivity_error",
+        "inactivity_error_key",
+        "inactivity_coverage_confirmed",
+        "inactivity_coverage_date",
+    )
+    for key in keys:
+        st.session_state.pop(key, None)
+
+
 def cohort_sizes(lazy_transactions):
     '''Distinct customers per first-purchase month, from the full transaction base.'''
     sizes = (lazy_transactions.group_by('customer_id')
@@ -128,16 +213,51 @@ if st.session_state.tx_fingerprint and len(st.session_state.tx_fingerprint) != 6
     st.session_state.update(tx_df=None, tx_fingerprint=None, segments_df=None,
         segments_fingerprint=None, segments_generated=False, pca_metadata=None,
         show_retention=False, retention_key=None, retention_result=None)
+    reset_inactivity_state()
 
 st.sidebar.header("Data upload")
 uploaded_transactions = st.sidebar.file_uploader(
     "Cleaned transactions (Parquet)", type=["parquet"],
     help="Uploads and generated results stay in this session; the app does not save upload artifacts to disk.",
 )
+
+# Expected input format help
+with st.sidebar.expander("Expected input format"):
+    st.write(
+        "Upload a cleaned Parquet file containing one row "
+        "per transaction line."
+    )
+    st.code(
+        "customer_id, transaction_id, product_id, "
+        "product_description, department, category, "
+        "transaction_date, price, quantity"
+    )
+    st.caption(
+        "Dates must be valid; price must be non-negative; "
+        "quantity must be positive."
+    )
+
 if uploaded_transactions is not None:
     new_fp = source_fingerprint(uploaded_transactions)
     if st.session_state.tx_fingerprint != new_fp:
-        st.session_state.tx_df = pl.read_parquet(io.BytesIO(uploaded_transactions.getvalue()))
+        # Read and validate the new dataset first
+        try:
+            raw_df = pl.read_parquet(
+                io.BytesIO(uploaded_transactions.getvalue())
+            )
+            new_tx_df, dropped_rows = validate_transactions(raw_df)
+        except Exception:
+            st.sidebar.error(
+                "The upload could not be processed. Check that it is a "
+                "readable Parquet file with the required columns and valid data."
+            )
+            st.stop()
+        if dropped_rows:
+            st.sidebar.warning(
+                f"{dropped_rows:,} invalid transaction rows were excluded."
+            )
+        reset_inactivity_state()
+        st.session_state.tx_df = new_tx_df
         st.session_state.tx_fingerprint = new_fp
         st.session_state.segments_generated = False
         st.session_state.segments_df = None
@@ -149,11 +269,24 @@ if uploaded_transactions is not None:
         st.sidebar.info("New data detected. Generate segments below.")
 elif st.session_state.tx_df is None:
     try:
-        st.session_state.tx_df = pl.read_parquet("customer_transactions_clean.parquet")
+        raw_df = pl.read_parquet("customer_transactions_clean.parquet")
+        new_tx_df, dropped_rows = validate_transactions(raw_df)
+        st.session_state.tx_df = new_tx_df
         st.session_state.tx_fingerprint = source_fingerprint("customer_transactions_clean.parquet")
+        if dropped_rows:
+            st.sidebar.warning(
+                f"{dropped_rows:,} invalid transaction rows were excluded from the demo file."
+            )
     except FileNotFoundError:
         st.info("Upload cleaned transactions from the sidebar to begin.")
         st.stop()
+    except Exception:
+        st.sidebar.error(
+            "The demo file could not be processed. Check that it is a "
+            "readable Parquet file with the required columns and valid data."
+        )
+        st.stop()
+
 tx_df = st.session_state.tx_df
 tx_lazy = tx_df.lazy()
 
@@ -185,12 +318,20 @@ if 'Primary_Category_Name' not in segments_df.columns:
     )
     st.session_state.segments_df = segments_df
 
-try:
-    customers = prepare_customers(segments_df.to_pandas())
-except ValueError as error:
-    st.error(str(error))
-    st.stop()
-profiles = segment_profiles(customers)
+# Reuse prepared presentation data within the session
+presentation_fp = st.session_state.tx_fingerprint
+if st.session_state.get("presentation_fp") != presentation_fp:
+    try:
+        customers = prepare_customers(segments_df.to_pandas())
+    except ValueError as error:
+        st.error(str(error))
+        st.stop()
+    profiles = segment_profiles(customers)
+    st.session_state["presentation_customers"] = customers
+    st.session_state["presentation_profiles"] = profiles
+    st.session_state["presentation_fp"] = presentation_fp
+customers = st.session_state["presentation_customers"]
+profiles = st.session_state["presentation_profiles"]
 labels = profiles['label'].to_dict()
 label_to_cluster = {label: cluster for cluster, label in labels.items()}
 clusters = sorted(customers['Cluster'].unique().tolist())
@@ -239,7 +380,7 @@ with tab3:
         plot_options = dict(x='Segment', y=metric, color='Segment', color_discrete_map=colors, category_orders=category_orders, points='outliers', log_y=log, labels={metric: METRICS[metric]})
         fig = px.violin(dist, box=True, **plot_options) if plot_type == 'Violin plot' else px.box(dist, **plot_options)
         fig.update_layout(height=500, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, theme=None)
     stats = stats_view.groupby('Segment')[metric].agg(['median', 'mean', 'std', 'count']).reindex(order)
     st.dataframe(stats.rename(columns={'median': 'Median', 'mean': 'Mean', 'std': 'Std dev', 'count': 'Customers'}), use_container_width=True)
 with tab4:
@@ -266,7 +407,7 @@ with tab4:
                 hovertemplate='%{hovertext}<br>Segment center: mean PC coordinates of displayed customers<extra></extra>',
                 marker=dict(size=9 if is_3d else 14, color=colors[label], symbol='diamond', line=dict(color='black', width=2))))
         fig.update_layout(height=600)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, theme=None)
         missing_axes = [pc for pc in axes if pc not in variance]
         if not variance:
             st.caption('Axis variance percentages are unavailable because PCA metadata is missing, invalid, or does not match these transactions. Diamonds labeled C# mark segment centers (mean PC coordinates).')
@@ -276,7 +417,11 @@ with tab4:
             st.caption('Axis percentages are explained-variance ratios from validated, fingerprint-matched PCA metadata. Diamonds labeled C# mark segment centers: mean PC coordinates of the displayed customers in each segment.')
     else:
         st.info('PCA projections require PC1, PC2, and PC3 in the generated segments.')
-    if st.checkbox('Show explained variance and loadings', value=True):
+    if st.checkbox(
+            'Show explained variance and loadings',
+            value=False,
+            key='show_pca_diagnostics',
+        ):
         metadata = pca_metadata
         if not metadata:
             st.info('Generate segments to populate PCA metadata.')
@@ -293,7 +438,7 @@ with tab4:
                     fig.add_trace(go.Scatter(x=pcs, y=evc * 100, name='Cumulative', mode='lines+markers', yaxis='y2'))
                     st.caption(f'Total explained variance ({len(evr)} components): {evc[-1]:.1%}')
                 fig.update_layout(height=350, yaxis_title='Individual variance (%)', yaxis2=dict(title='Cumulative (%)', overlaying='y', side='right', range=[0, 100]))
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, theme=None)
             loadings, names = metadata.get('loadings'), metadata.get('feature_names')
             try:
                 values = np.asarray(loadings, dtype=float) if loadings is not None else None
@@ -342,7 +487,7 @@ with tab5:
                 hovertemplate='Cohort: %{y}<br>Months since first observed purchase: %{x}<br>Retention: %{z:.1%}<br>Retained customers: %{customdata[0]:,.0f} of %{customdata[1]:,.0f}<extra></extra>')
             fig.update_yaxes(type='category')
             fig.update_layout(height=600, xaxis_title='Months since first observed purchase', yaxis_title='First observed purchase cohort')
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, theme=None)
             columns = st.columns(3)
             for column, period in zip(columns[:2], ['1', '3']):
                 if period in retention.columns:
@@ -365,10 +510,13 @@ with tab6:
         'A predicted inactivity score is not a diagnosis of churn, and explanations describe model associations—not causes.'
     )
 
-    # Lazy initialization: prepare transactions using Polars DataFrame directly
-    if 'inactivity_prepared_tx' not in st.session_state:
+    # Prepare transactions for inactivity model (invalidate when source fingerprint changes)
+    current_fp = st.session_state.tx_fingerprint
+    if (st.session_state.get('inactivity_prepared_tx_fingerprint') != current_fp
+            or 'inactivity_prepared_tx' not in st.session_state):
         with st.spinner('Preparing transactions for inactivity model…'):
             st.session_state['inactivity_prepared_tx'] = prepare_inactivity_transactions(tx_df)
+            st.session_state['inactivity_prepared_tx_fingerprint'] = current_fp
     prepared_tx = st.session_state['inactivity_prepared_tx']
 
     latest_transaction_date = prepared_tx['order_date'].max().date()
@@ -385,11 +533,22 @@ with tab6:
     coverage_confirmed = st.checkbox(
         'I confirm the export is complete through the date below.', value=False, key='inactivity_coverage_confirmed'
     )
+    today = date.today()
+    if latest_transaction_date > today:
+        st.error(
+            "The dataset contains transaction dates later than "
+            "the current date. Verify the source data before scoring."
+        )
+        st.stop()
     coverage_date = st.date_input(
         'Data complete through',
         value=latest_transaction_date,
         min_value=latest_transaction_date,
-        help='Use the date confirmed by the source system, not merely the last date on which a purchase occurred.',
+        max_value=today,
+        help=(
+            'Use the source system\'s confirmed completeness date, '
+            'not merely the date of the last purchase.'
+        ),
         key='inactivity_coverage_date',
     )
 
@@ -397,10 +556,8 @@ with tab6:
         st.warning('Confirm data completeness above to enable training and scoring.')
         st.stop()
 
-    # Fingerprint only once per session (reuse the transaction fingerprint from session)
-    if 'inactivity_file_fingerprint' not in st.session_state:
-        st.session_state['inactivity_file_fingerprint'] = st.session_state.tx_fingerprint
-    file_fingerprint = st.session_state['inactivity_file_fingerprint']
+    # Derive fingerprint directly from active dataset (no stale stored fingerprint)
+    file_fingerprint = st.session_state.tx_fingerprint
     run_key = (file_fingerprint, coverage_date.isoformat())
 
     if st.session_state.get('inactivity_error_key') != run_key:
@@ -414,8 +571,15 @@ with tab6:
                 st.session_state['inactivity_run_key'] = run_key
                 st.session_state.pop('inactivity_error', None)
                 st.session_state.pop('inactivity_error_key', None)
-            except Exception as exc:
-                st.session_state['inactivity_error'] = str(exc)
+            except Exception:
+                logger.exception(
+                    "Inactivity model failed for source %s",
+                    st.session_state.tx_fingerprint,
+                )
+                st.session_state['inactivity_error'] = (
+                    "The model could not be trained. Check the data coverage "
+                    "and required columns, then try again."
+                )
                 st.session_state['inactivity_error_key'] = run_key
                 st.session_state.pop('inactivity_result', None)
                 st.session_state.pop('inactivity_run_key', None)
@@ -480,7 +644,7 @@ with tab6:
             height=300, legend=dict(yanchor='bottom', y=0.01, xanchor='right', x=0.99),
             margin=dict(l=40, r=20, t=40, b=40)
         )
-        curve_col1.plotly_chart(roc_fig, use_container_width=True)
+        curve_col1.plotly_chart(roc_fig, use_container_width=True, theme=None)
         
         # Precision-Recall Curve
         precision, recall, _ = precision_recall_curve(y_true, y_prob)
@@ -494,7 +658,7 @@ with tab6:
             height=300, legend=dict(yanchor='bottom', y=0.01, xanchor='right', x=0.99),
             margin=dict(l=40, r=20, t=40, b=40), yaxis_range=[0, 1.05]
         )
-        curve_col2.plotly_chart(pr_fig, use_container_width=True)
+        curve_col2.plotly_chart(pr_fig, use_container_width=True, theme=None)
         
         # Calibration (Reliability) Plot
         prob_true, prob_pred = calibration_curve(y_true, y_prob, n_bins=10, strategy='quantile')
@@ -506,7 +670,7 @@ with tab6:
             height=300, legend=dict(yanchor='bottom', y=0.01, xanchor='right', x=0.99),
             margin=dict(l=40, r=20, t=40, b=40)
         )
-        curve_col3.plotly_chart(cal_fig, use_container_width=True)
+        curve_col3.plotly_chart(cal_fig, use_container_width=True, theme=None)
         
         st.caption('Calibration shows whether predicted probabilities match observed frequencies. A well-calibrated model falls on the diagonal. Brier score alone does not establish calibration.')
 
@@ -540,17 +704,15 @@ with tab6:
         x='no_purchase_probability',
         color='Risk band',
         nbins=20,
-        color_discrete_map={
-            'Low (<20%)': '#00CC96',
-            'Medium (20-50%)': '#FFA15A',
-            'High (50-80%)': '#EF553B',
-            'Very High (>80%)': '#AB63FA',
+        color_discrete_map=RISK_COLORS,
+        labels={
+            'no_purchase_probability': 'Estimated probability of no purchase in the next 30 days',
+            'count': 'Customers',
         },
-        labels={'no_purchase_probability': 'Estimated probability of no purchase next 30 days', 'count': 'Customers'},
         title='Distribution of inactivity scores by risk band',
     )
     hist.update_layout(height=330, yaxis_title='Customers', bargap=0.05)
-    st.plotly_chart(hist, use_container_width=True)
+    st.plotly_chart(hist, use_container_width=True, theme=None)
 
     shown = predictions.head(100).copy()
     shown['no_purchase_probability'] = shown['no_purchase_probability'].map(lambda x: f'{x:.1%}')
@@ -641,7 +803,7 @@ with tab6:
     )
     global_fig.add_vline(x=0, line_color='gray', line_width=1)
     global_fig.update_layout(height=450)
-    st.plotly_chart(global_fig, use_container_width=True)
+    st.plotly_chart(global_fig, use_container_width=True, theme=None)
     st.dataframe(
         global_effects[['metric', 'coefficient_per_std', 'odds_ratio_per_std', 'direction']].head(15),
         use_container_width=True,

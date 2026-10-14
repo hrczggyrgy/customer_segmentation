@@ -239,7 +239,7 @@ def render_contribution(profiles, selected, colors):
         yaxis=dict(automargin=True),
     )
     fig.update_xaxes(range=[0, 105])
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, theme=None)
     
     # KPI cards
     ratio_col, gap_col = st.columns(2)
@@ -275,7 +275,7 @@ def render_profiles(customers, profiles, selected):
         color_continuous_scale='RdBu_r', color_continuous_midpoint=0, zmin=-3, zmax=3, text_auto='.1f', aspect='auto')
     fig.update_traces(customdata=custom, hovertemplate='%{y}<br>%{x}<br>Segment mean: %{customdata[0]:,.2f}<br>Full-base mean: %{customdata[1]:,.2f}<br>Standardized difference: %{customdata[2]:.2f}<extra></extra>')
     fig.update_layout(height=max(400, len(visible) * 55), coloraxis_colorbar_title='Std. difference')
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, theme=None)
     st.caption('Red means above average, not necessarily better: higher recency and delay can signal overdue purchases. Values are (segment mean − full-base mean) / full-base standard deviation. Colors saturate at ±3; constant metrics display zero.')
     st.subheader('What distinguishes these segments?')
     differentiators = segment_differentiators(customers, visible.index.tolist())
@@ -372,10 +372,10 @@ def render_risk(customers, selected, colors, order, source_fingerprint):
         signature = f'{source_fingerprint}|{selected}|{percentile}|{log}|{show_history}'
         key = 'risk_' + hashlib.sha256(signature.encode()).hexdigest()[:12]
         if 'on_select' in inspect.signature(st.plotly_chart).parameters:
-            event = st.plotly_chart(fig, use_container_width=True, key=key, on_select='rerun', selection_mode=('points', 'box', 'lasso'))
+            event = st.plotly_chart(fig, use_container_width=True, key=key, on_select='rerun', selection_mode=('points', 'box', 'lasso'), theme=None)
             ids = selected_customer_ids(event.selection.points)
         else:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, theme=None)
             st.caption('Upgrade to Streamlit >=1.35 for selection; default targets are shown below.')
     else:
         st.info('No plottable customers with these settings. Change the log/history options.')
@@ -457,7 +457,7 @@ def render_zscore_small_multiples(customers, profiles, selected, colors, order):
     # Clean facet titles
     fig.for_each_annotation(lambda a: a.update(text=a.text.split('=')[-1]))
     fig.update_layout(showlegend=False, margin=dict(l=10, r=10, t=60, b=40))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, theme=None)
 
 
 def render_radar(customers, selected, colors, order):

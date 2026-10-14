@@ -112,7 +112,7 @@ class RenderingTests(unittest.TestCase):
         self.st = types.ModuleType('streamlit')
         self.st.columns = lambda n: [Column() for _ in range(n)]
         self.st.caption = lambda text: captions.append(text)
-        for name in ['subheader', 'header', 'info', 'write', 'dataframe']:
+        for name in ['subheader', 'header', 'info', 'write', 'dataframe', 'markdown']:
             setattr(self.st, name, lambda *args, **kwargs: None)
         self.st.plotly_chart = lambda fig, **kwargs: fig.to_plotly_json()
         self.st.column_config = types.SimpleNamespace(NumberColumn=lambda *args, **kwargs: kwargs)
@@ -135,7 +135,7 @@ class RenderingTests(unittest.TestCase):
     def test_profile_narrative_renders_and_is_qualified(self):
         with patch.dict(sys.modules, {'streamlit': self.st}):
             render_profiles(self.customers, self.profiles, [1])
-        self.assertTrue(any('SD below the full-base average' in text for text in self.captions))
+        self.assertTrue(any('More recent last observed purchase' in text for text in self.captions))
         self.assertTrue(any('not statistical significance' in text for text in self.captions))
 
 
