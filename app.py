@@ -25,18 +25,35 @@ for key, default in {
         st.session_state[key] = default
 
 
-def pca_variance_by_component(metadata, fingerprint):
-    '''Explained-variance ratios by PC name, only from valid, fingerprint-matched metadata.'''
+def pca_variance_diagnostics(metadata, fingerprint):
+    '''Validated (ratios, cumulative-or-None) arrays, or None if metadata is unusable.
+
+    Requires a matching source fingerprint, finite ratios in [0, 1] summing to at most 1,
+    and, when present, a cumulative array of the same length consistent with the ratios.'''
     if not isinstance(metadata, dict) or metadata.get('source_fingerprint') != fingerprint:
-        return {}
+        return None
     try:
         ratios = np.asarray(metadata.get('explained_variance_ratio'), dtype=float)
+        raw_cumulative = metadata.get('explained_variance_cumulative')
+        cumulative = None if raw_cumulative is None else np.asarray(raw_cumulative, dtype=float)
     except (TypeError, ValueError):
-        return {}
+        return None
     if (ratios.ndim != 1 or ratios.size == 0 or not np.isfinite(ratios).all()
-            or (ratios < 0).any() or ratios.sum() > 1 + 1e-6):
+            or (ratios < 0).any() or (ratios > 1).any() or ratios.sum() > 1 + 1e-6):
+        return None
+    if cumulative is not None:
+        if (cumulative.shape != ratios.shape or not np.isfinite(cumulative).all()
+                or not np.allclose(cumulative, np.cumsum(ratios), atol=1e-6)):
+            return None
+    return ratios, cumulative
+
+
+def pca_variance_by_component(metadata, fingerprint):
+    '''Explained-variance ratios by PC name, from the same validated diagnostics as the chart.'''
+    diagnostics = pca_variance_diagnostics(metadata, fingerprint)
+    if diagnostics is None:
         return {}
-    return {f'PC{i + 1}': float(r) for i, r in enumerate(ratios)}
+    return {f'PC{i + 1}': float(r) for i, r in enumerate(diagnostics[0])}
 
 
 def pc_axis_label(pc, variance):
@@ -47,8 +64,9 @@ def cohort_sizes(lazy_transactions):
     '''Distinct customers per first-purchase month, from the full transaction base.'''
     sizes = (lazy_transactions.group_by('customer_id')
         .agg(pl.col('transaction_date').dt.truncate('1mo').min().alias('CohortMonth'))
+        .filter(pl.col('CohortMonth').is_not_null())
         .group_by('CohortMonth').agg(pl.col('customer_id').n_unique().alias('size')).collect())
-    return {month.strftime('%Y-%m'): int(n) for month, n in sizes.iter_rows()}
+    return {month.strftime('%Y-%m'): int(n) for month, n in sizes.iter_rows() if month is not None}
 
 
 def get_or_generate_segments(tx_df, tx_fingerprint, force_refresh=False):
@@ -171,10 +189,11 @@ with tab3:
     plot_type = st.radio('Plot type', ['Boxplot', 'Violin plot'], index=0, horizontal=True, key='distribution_plot_type')
     log = st.checkbox('Logarithmic axis', value=metric in ['Total_Lifetime_Spend', 'Average_Order_Value_AOV', 'Total_Lifetime_Transactions'], key=f'distribution_log_{metric}')
     chart_name = 'violin plot' if plot_type == 'Violin plot' else 'boxplot'
-    finite = view[view[metric].replace([np.inf, -np.inf], np.nan).notna()]
+    stats_view = view.assign(**{metric: view[metric].replace([np.inf, -np.inf], np.nan)})
+    finite = stats_view[stats_view[metric].notna()]
     dist = finite[finite[metric].gt(0)] if log else finite
     if len(finite) < len(view):
-        st.caption(f'{len(view) - len(finite):,} missing or non-finite values are not drawn; summary statistics ignore missing values.')
+        st.caption(f'{len(view) - len(finite):,} missing or non-finite values are not drawn; summary statistics also exclude them.')
     if log and len(dist) < len(finite):
         st.caption(f'{len(finite) - len(dist):,} non-positive observations omitted from the logarithmic {chart_name}; summary statistics include them.')
     if dist.empty:
@@ -184,13 +203,15 @@ with tab3:
         fig = px.violin(dist, box=True, **plot_options) if plot_type == 'Violin plot' else px.box(dist, **plot_options)
         fig.update_layout(height=500, showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
-    stats = view.groupby('Segment')[metric].agg(['median', 'mean', 'std', 'count']).reindex(order)
+    stats = stats_view.groupby('Segment')[metric].agg(['median', 'mean', 'std', 'count']).reindex(order)
     st.dataframe(stats.rename(columns={'median': 'Median', 'mean': 'Mean', 'std': 'Std dev', 'count': 'Customers'}), use_container_width=True)
 with tab4:
     st.header('Model exploration: PCA')
     st.caption('Projections show only part of the clustering space; visual overlap does not establish full-space overlap.')
+    pca_metadata = st.session_state.pca_metadata
+    diagnostics = pca_variance_diagnostics(pca_metadata, st.session_state.tx_fingerprint)
+    variance = pca_variance_by_component(pca_metadata, st.session_state.tx_fingerprint)
     if {'PC1', 'PC2', 'PC3'}.issubset(view.columns):
-        variance = pca_variance_by_component(st.session_state.pca_metadata, st.session_state.tx_fingerprint)
         projection = st.radio('Projection', ['PC1 vs PC2', 'PC1 vs PC3', '3D (PC1/PC2/PC3)'], horizontal=True)
         is_3d = projection.startswith('3D')
         axes = ['PC1', 'PC2', 'PC3'] if is_3d else ['PC1', 'PC3' if projection.endswith('PC3') else 'PC2']
@@ -209,38 +230,45 @@ with tab4:
                 marker=dict(size=9 if is_3d else 14, color=colors[label], symbol='diamond', line=dict(color='black', width=2))))
         fig.update_layout(height=600)
         st.plotly_chart(fig, use_container_width=True)
-        if variance:
-            st.caption('Axis percentages are explained-variance ratios from fingerprint-matched PCA metadata. Diamonds labeled C# mark segment centers: mean PC coordinates of the displayed customers in each segment.')
-        else:
+        missing_axes = [pc for pc in axes if pc not in variance]
+        if not variance:
             st.caption('Axis variance percentages are unavailable because PCA metadata is missing, invalid, or does not match these transactions. Diamonds labeled C# mark segment centers (mean PC coordinates).')
+        elif missing_axes:
+            st.caption(f"Variance percentage is unavailable for {', '.join(missing_axes)} in the validated PCA metadata; other axes show explained-variance ratios. Diamonds labeled C# mark segment centers (mean PC coordinates).")
+        else:
+            st.caption('Axis percentages are explained-variance ratios from validated, fingerprint-matched PCA metadata. Diamonds labeled C# mark segment centers: mean PC coordinates of the displayed customers in each segment.')
     else:
         st.info('PCA projections require PC1, PC2, and PC3 in the generated segments.')
     if st.checkbox('Show explained variance and loadings', value=True):
-        metadata = st.session_state.pca_metadata
+        metadata = pca_metadata
         if not metadata:
             st.info('Generate segments to populate PCA metadata.')
         elif metadata.get('source_fingerprint') != st.session_state.tx_fingerprint:
             st.warning('PCA metadata does not match these transactions. Refresh segments.')
         else:
-            evr = metadata.get('explained_variance_ratio', [])
-            evc = metadata.get('explained_variance_cumulative', [])
-            if evr:
+            if diagnostics is None:
+                st.warning('Explained-variance data is missing, malformed, or inconsistent, so the variance chart is unavailable.')
+            else:
+                evr, evc = diagnostics
                 pcs = [f'PC{i + 1}' for i in range(len(evr))]
-                fig = go.Figure(go.Bar(x=pcs, y=np.array(evr) * 100, name='Individual'))
-                if evc:
-                    fig.add_trace(go.Scatter(x=[f'PC{i + 1}' for i in range(len(evc))], y=np.array(evc) * 100, name='Cumulative', mode='lines+markers', yaxis='y2'))
+                fig = go.Figure(go.Bar(x=pcs, y=evr * 100, name='Individual'))
+                if evc is not None:
+                    fig.add_trace(go.Scatter(x=pcs, y=evc * 100, name='Cumulative', mode='lines+markers', yaxis='y2'))
                     st.caption(f'Total explained variance ({len(evr)} components): {evc[-1]:.1%}')
                 fig.update_layout(height=350, yaxis_title='Individual variance (%)', yaxis2=dict(title='Cumulative (%)', overlaying='y', side='right', range=[0, 100]))
                 st.plotly_chart(fig, use_container_width=True)
-            loadings, names = metadata.get('loadings', []), metadata.get('feature_names', [])
-            if loadings and names and len(loadings) == len(names):
-                values = np.asarray(loadings)
-                if values.ndim == 2:
-                    table = pd.DataFrame(values, index=names, columns=[f'PC{i + 1}' for i in range(values.shape[1])])
-                    with st.expander('Top five signed loadings per component'):
-                        for pc in table:
-                            top = table[pc].abs().nlargest(5).index
-                            st.write(pc + ': ' + ', '.join(f'{name} ({table.loc[name, pc]:+.3f})' for name in top))
+            loadings, names = metadata.get('loadings'), metadata.get('feature_names')
+            try:
+                values = np.asarray(loadings, dtype=float) if loadings is not None else None
+            except (TypeError, ValueError):
+                values = None
+            if (values is not None and names and values.ndim == 2 and values.shape[0] == len(names)
+                    and np.isfinite(values).all()):
+                table = pd.DataFrame(values, index=names, columns=[f'PC{i + 1}' for i in range(values.shape[1])])
+                with st.expander('Top five signed loadings per component'):
+                    for pc in table:
+                        top = table[pc].abs().nlargest(5).index
+                        st.write(pc + ': ' + ', '.join(f'{name} ({table.loc[name, pc]:+.3f})' for name in top))
 with tab5:
     st.header('Monthly repeat-purchase retention')
     st.caption('Full transaction base; global segment filters do not change this view. Cohort = first observed purchase month. Missing cells are unobserved; 0% means an observed period with no returning customers.')
