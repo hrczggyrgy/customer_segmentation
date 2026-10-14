@@ -85,7 +85,8 @@ class SafetyTests(unittest.TestCase):
         for forbidden in ['@st.cache_data', 'write_parquet', 'pca_metadata.json', 'customer_segments_advanced.parquet', '.clear()']:
             self.assertNotIn(forbidden, source)
         self.assertIn('source_fingerprint(uploaded_transactions)', source)
-        self.assertIn('source_fingerprint("customer_transactions_clean.parquet")', source)
+        # Check that demo file fingerprints are used
+        self.assertIn('source_fingerprint(demo_path)', source)
         standalone = (Path(__file__).resolve().parents[1] / 'segmentation.py').read_text()
         self.assertIn('fingerprint = source_fingerprint(data_path)', standalone)
 

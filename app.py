@@ -367,16 +367,30 @@ if uploaded_transactions is not None:
         st.session_state.retention_result = None
         st.sidebar.info("New data detected. Generate segments below.")
 elif st.session_state.tx_df is None:
+    # Demo dataset selector
+    demo_files = {
+        "Online Retail II (cleaned)": "sample_data/online_retail_ii_cleaned.parquet",
+        "Customer Transactions (legacy)": "customer_transactions_clean.parquet",
+    }
+    selected_demo = st.sidebar.selectbox(
+        "Demo dataset",
+        options=list(demo_files.keys()),
+        index=0,
+        help="Select a built-in demo dataset to explore without uploading.",
+    )
+    demo_path = demo_files[selected_demo]
+    
     try:
-        raw_df = pl.read_parquet("customer_transactions_clean.parquet")
+        raw_df = pl.read_parquet(demo_path)
         new_tx_df, dropped_rows = validate_transactions(raw_df)
         st.session_state.tx_df = new_tx_df
-        st.session_state.tx_fingerprint = source_fingerprint("customer_transactions_clean.parquet")
+        st.session_state.tx_fingerprint = source_fingerprint(demo_path)
         if dropped_rows:
             st.sidebar.warning(
                 f"{dropped_rows:,} invalid transaction rows were excluded from the demo file."
             )
     except FileNotFoundError:
+        st.sidebar.error(f"Demo file not found: {demo_path}")
         st.info("Upload cleaned transactions from the sidebar to begin.")
         st.stop()
     except Exception:
