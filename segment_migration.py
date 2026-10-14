@@ -671,7 +671,7 @@ def render_segment_migration(
                         # Use the labels from fitting (already computed inside fit_frozen_model)
                         snap.cluster_labels = frozen.kmeans.labels_
                         aligned = align_features(snap.features_df, frozen)
-                        snap.pca_data = frozen.pca.transform(frozen.transform(aligned))
+                        snap.pca_data = frozen.transform(aligned)
                     else:
                         snap.cluster_labels = assign_clusters_frozen(snap.features_df, frozen)
                         aligned = align_features(snap.features_df, frozen)
