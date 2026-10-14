@@ -326,6 +326,64 @@ def assign_clusters_frozen(
     return frozen.kmeans.predict(pca_data)
 
 
+def build_migration_labels(
+    snapshots: list[SnapshotResult]
+) -> dict:
+    """Generate descriptive labels for migration segments per snapshot.
+    
+    Uses the same logic as segment_profiles: spend quartiles + repeat/delay behavior.
+    Returns dict: {(snapshot_idx, cluster_idx): 'label'}
+    """
+    labels = {}
+    
+    for i, snap in enumerate(snapshots):
+        # Build features with cluster labels
+        features_pd = snap.features_df.to_pandas()
+        features_pd['mig_cluster'] = snap.cluster_labels
+        
+        # Only consider repeat buyers for delay/spend quartiles
+        repeat = features_pd[features_pd['Average_InterPurchase_Time_AIPT'].gt(0)]
+        
+        if len(repeat) == 0:
+            # No repeat buyers - all clusters get "limited repeat history" label
+            for cluster_idx in range(snap.cluster_labels.max() + 1):
+                labels[(i, cluster_idx)] = f'M{cluster_idx + 1} · limited repeat history'
+            continue
+        
+        # Spend quartiles from repeat buyers in this snapshot
+        low, high = repeat['Total_Lifetime_Spend'].quantile([.25, .75])
+        
+        for cluster_idx in range(snap.cluster_labels.max() + 1):
+            cluster_data = features_pd[features_pd['mig_cluster'] == cluster_idx]
+            cluster_repeat = cluster_data[cluster_data['Average_InterPurchase_Time_AIPT'].gt(0)]
+            
+            # Median spend
+            median_spend = cluster_data['Total_Lifetime_Spend'].median()
+            if median_spend >= high:
+                value = 'high-spend'
+            elif median_spend <= low:
+                value = 'low-spend'
+            else:
+                value = 'mid-spend'
+            
+            # Repeat share and delay
+            repeat_share = len(cluster_repeat) / len(cluster_data) if len(cluster_data) > 0 else 0
+            median_delay = cluster_repeat['Churn_Risk_Index_CRI'].median() if len(cluster_repeat) > 0 else np.nan
+            
+            if repeat_share < .5 or pd.isna(median_delay):
+                behavior = 'limited repeat history'
+            elif median_delay >= 2:
+                behavior = 'overdue repeat buyers'
+            elif median_delay > 1:
+                behavior = 'delayed repeat buyers'
+            else:
+                behavior = 'on-cadence repeat buyers'
+            
+            labels[(i, cluster_idx)] = f'M{cluster_idx + 1} · {value} {behavior}'
+    
+    return labels
+
+
 def build_sankey_data(
     snapshots: list[SnapshotResult],
     config: MigrationConfig
@@ -336,6 +394,9 @@ def build_sankey_data(
         - Sankey dict with 'nodes', 'links', 'node_labels', 'node_colors'
         - Switch-rate DataFrame (only for customers in migration clusters at both adjacent snapshots)
     """
+    # Generate descriptive labels for migration segments
+    mig_labels = build_migration_labels(snapshots)
+    
     # Get all unique customers across all snapshots
     all_customers = set()
     for snap in snapshots:
@@ -343,7 +404,7 @@ def build_sankey_data(
     all_customers = sorted(all_customers)
     
     # Build customer-state matrix: rows=customers, cols=snapshots
-    # States: 'Not yet observed', 'No purchase in window', 'M1', 'M2', ...
+    # States: 'Not yet observed', 'No purchase in window', 'M1 · label', 'M2 · label', ...
     n_snapshots = len(snapshots)
     customer_states = pd.DataFrame(index=all_customers, columns=[f'Snap{i+1}' for i in range(n_snapshots)])
     customer_states = customer_states.fillna('Not yet observed')
@@ -354,7 +415,8 @@ def build_sankey_data(
         for cust in all_customers:
             if cust in snap_customers:
                 cluster = snap.cluster_labels[snap.features_df['customer_id'].to_list().index(cust)]
-                customer_states.loc[cust, f'Snap{i+1}'] = f'M{cluster + 1}'
+                state_label = mig_labels.get((i, cluster), f'M{cluster + 1}')
+                customer_states.loc[cust, f'Snap{i+1}'] = state_label
             elif cust in customer_states.index:
                 # Check if customer existed before this snapshot
                 prior_snaps = [snapshots[j].features_df['customer_id'].to_list() for j in range(i)]
@@ -373,20 +435,20 @@ def build_sankey_data(
     all_trans = pd.concat(transitions, ignore_index=True)
     
     # Build Sankey nodes (distinct per column even if same label)
-    # Format: "Snap1: M1", "Snap1: M2", ..., "Snap2: M1", ...
+    # Format: "Snap1: M1 · high-spend overdue", "Snap1: M2 · low-spend on-cadence", ...
     node_labels = []
     node_colors = []
     node_to_idx = {}
     
     for i in range(n_snapshots):
         states_at_snap = customer_states[f'Snap{i+1}'].unique()
-        # Order: Not yet observed, No purchase in window, then M1, M2, ...
+        # Order: Not yet observed, No purchase in window, then migration segments
         ordered = []
         if 'Not yet observed' in states_at_snap:
             ordered.append('Not yet observed')
         if 'No purchase in window' in states_at_snap:
             ordered.append('No purchase in window')
-        m_states = sorted([s for s in states_at_snap if s.startswith('M')], key=lambda x: int(x[1:]))
+        m_states = sorted([s for s in states_at_snap if s.startswith('M')])
         ordered.extend(m_states)
         
         for state in ordered:
@@ -401,7 +463,7 @@ def build_sankey_data(
                 node_colors.append('#fbbf24')  # amber
             else:
                 # Consistent colors for same M# across snapshots
-                m_idx = int(state[1:]) - 1
+                m_idx = int(state[1:].split(' · ')[0]) - 1
                 palette = ['#2563eb', '#ef4444', '#22c55e', '#a855f7', '#f97316', '#ec4899', '#06b6d4', '#84cc16']
                 node_colors.append(palette[m_idx % len(palette)])
     
