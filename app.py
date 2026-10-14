@@ -337,13 +337,11 @@ with tab6:
         'A predicted inactivity score is not a diagnosis of churn, and explanations describe model associations—not causes.'
     )
 
-    # Use the already-loaded transaction data
-    try:
-        tx_pd = tx_df.to_pandas()
-        prepared_tx = prepare_inactivity_transactions(tx_pd)
-    except Exception as exc:
-        st.error(f'Could not prepare transactions for inactivity model: {exc}')
-        st.stop()
+    # Lazy initialization: prepare transactions using Polars DataFrame directly
+    if 'inactivity_prepared_tx' not in st.session_state:
+        with st.spinner('Preparing transactions for inactivity model…'):
+            st.session_state['inactivity_prepared_tx'] = prepare_inactivity_transactions(tx_df)
+    prepared_tx = st.session_state['inactivity_prepared_tx']
 
     latest_transaction_date = prepared_tx['order_date'].max().date()
     st.caption(
@@ -371,15 +369,22 @@ with tab6:
         st.warning('Confirm data completeness above to enable training and scoring.')
         st.stop()
 
-    file_fingerprint = hashlib.sha256(tx_df.to_pandas().to_parquet()).hexdigest()
+    # Fingerprint only once per session (uses cached Polars DF bytes)
+    if 'inactivity_file_fingerprint' not in st.session_state:
+        import io
+        buf = io.BytesIO()
+        tx_df.write_parquet(buf)
+        st.session_state['inactivity_file_fingerprint'] = hashlib.sha256(buf.getvalue()).hexdigest()
+    file_fingerprint = st.session_state['inactivity_file_fingerprint']
     run_key = (file_fingerprint, coverage_date.isoformat())
+
     if st.session_state.get('inactivity_error_key') != run_key:
         st.session_state.pop('inactivity_error', None)
         st.session_state.pop('inactivity_error_key', None)
     if st.button('Train model and score active customers', type='primary', use_container_width=True, key='inactivity_train_button'):
         with st.spinner('Building historical snapshots, testing the model, and scoring active customers…'):
             try:
-                result = fit_evaluate_and_score(tx_pd, coverage_date)
+                result = fit_evaluate_and_score(tx_df, coverage_date)
                 st.session_state['inactivity_result'] = result
                 st.session_state['inactivity_run_key'] = run_key
                 st.session_state.pop('inactivity_error', None)

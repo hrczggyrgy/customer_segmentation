@@ -38,7 +38,7 @@ if uploaded is None:
 
 try:
     raw_bytes = uploaded.getvalue()
-    tx = pl.read_parquet(io.BytesIO(raw_bytes)).to_pandas()
+    tx = pl.read_parquet(io.BytesIO(raw_bytes))
     prepared = prepare_transactions(tx)
 except Exception as exc:
     st.error(f"Could not read or validate this transaction file: {exc}")
