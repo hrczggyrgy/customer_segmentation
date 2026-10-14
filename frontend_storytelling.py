@@ -304,106 +304,310 @@ def render_profiles(customers, profiles, selected):
     st.caption('Descriptions use full-base spend quartiles and repeat-buyer cadence. Actions are hypotheses, not validated recommendations; delay is not a churn probability.')
 
 
-def render_risk(customers, selected, colors, order, source_fingerprint):
+def render_risk(customers, selected, colors, order, source_fingerprint, currency="CU"):
     import hashlib
     import inspect
     import plotly.express as px
     import plotly.graph_objects as go
     import streamlit as st
-    st.header('Risk–value portfolio')
-    st.caption('Purchase delay = recency / average purchase interval. Select points to inspect customers; it is not a calibrated churn probability.')
-    view = customers[customers['Cluster'].isin(selected)]
-    percentile = st.slider('High-value spend percentile', 50, 99, 80, key='risk_percentile')
-    log = st.checkbox('Logarithmic spend axis', value=True, key='risk_log')
-    show_history = st.checkbox('Show insufficient repeat history', value=True, key='risk_history')
-    repeat = customers[customers['Average_InterPurchase_Time_AIPT'].gt(0)]
-    threshold = repeat['Total_Lifetime_Spend'].quantile(percentile / 100)
-    plot = view.copy()
-    plot['History'] = np.where(plot['Average_InterPurchase_Time_AIPT'].gt(0), 'Repeat history', 'Insufficient history')
-    plot.loc[plot['History'].eq('Insufficient history'), 'Churn_Risk_Index_CRI'] = 0
+    
+    st.header("Risk–value portfolio")
+    st.caption(
+        "Historical customer value versus purchase delay. "
+        "This view identifies candidates for investigation—not predicted churn."
+    )
+
+    with st.expander("How to read this portfolio"):
+        st.write(
+            "• Further right: longer since the last purchase relative to "
+            "the customer's usual purchase interval.\n"
+            "• Higher up: more spend in the observed dataset.\n"
+            "• The highlighted region is an outreach-test hypothesis.\n"
+            "• Customers without repeat history have no reliable delay estimate."
+        )
+
+    # --- Controls in three columns ---
+    value_col, delay_col, display_col = st.columns([1.2, 1.2, 1])
+
+    with value_col:
+        percentile = st.slider(
+            "High-value threshold percentile",
+            50, 99, 80,
+            key="risk_percentile",
+            help=(
+                "Calculated from full-base repeat buyers with valid spend. "
+                "Global segment filters do not change this benchmark."
+            ),
+        )
+
+    with delay_col:
+        delay_cutoff = st.slider(
+            "Minimum purchase delay",
+            1.0, 5.0, 2.0, 0.25,
+            key="risk_delay_cutoff",
+            help="2× means recency is twice the usual purchase interval.",
+        )
+
+    with display_col:
+        log = st.checkbox(
+            "Log spend axis", value=True, key="risk_log",
+            help="Makes a wide range of spend values easier to inspect.",
+        )
+        show_history = st.checkbox(
+            "Show limited history", value=True, key="risk_history",
+        )
+
+    # --- Build narrow working frame with sanitized numerics ---
+    numeric_cols = [
+        "Total_Lifetime_Spend",
+        "Average_InterPurchase_Time_AIPT",
+        "Churn_Risk_Index_CRI",
+        "Recency_Days",
+        "Average_Order_Value_AOV",
+    ]
+
+    work = customers[
+        ["customer_id", "Cluster", "Segment", *numeric_cols]
+    ].copy()
+
+    for col in numeric_cols:
+        work[col] = pd.to_numeric(work[col], errors="coerce").replace(
+            [np.inf, -np.inf], np.nan
+        )
+
+    repeat_history = work["Average_InterPurchase_Time_AIPT"].gt(0)
+    valid_spend = work["Total_Lifetime_Spend"].ge(0)
+    valid_delay = work["Churn_Risk_Index_CRI"].ge(0)
+
+    base_spend = work.loc[
+        repeat_history & valid_spend, "Total_Lifetime_Spend"
+    ]
+    threshold = (
+        base_spend.quantile(percentile / 100)
+        if not base_spend.empty else np.nan
+    )
+
+    view = work.loc[work["Cluster"].isin(selected)].copy()
+
+    candidate_mask = (
+        view["Average_InterPurchase_Time_AIPT"].gt(0)
+        & view["Churn_Risk_Index_CRI"].ge(delay_cutoff)
+        & view["Total_Lifetime_Spend"].ge(threshold)
+    )
+    candidates = view.loc[candidate_mask].copy()
+
+    # Plot frame: drop invalid observations before passing to Plotly
+    plot = view.loc[
+        view["Total_Lifetime_Spend"].ge(0)
+        & (
+            (view["Average_InterPurchase_Time_AIPT"].gt(0) & view["Churn_Risk_Index_CRI"].ge(0))
+            | view["Average_InterPurchase_Time_AIPT"].eq(0)
+        )
+    ].copy()
+
+    plot["History"] = np.where(
+        plot["Average_InterPurchase_Time_AIPT"].gt(0), "Repeat history", "Insufficient history"
+    )
+    plot.loc[plot["History"].eq("Insufficient history"), "Churn_Risk_Index_CRI"] = 0
+
     if not show_history:
-        plot = plot[plot['History'].eq('Repeat history')]
+        plot = plot[plot["History"].eq("Repeat history")]
+
     if log:
-        omitted = int(plot['Total_Lifetime_Spend'].le(0).sum())
-        plot = plot[plot['Total_Lifetime_Spend'].gt(0)]
+        omitted = int(plot["Total_Lifetime_Spend"].le(0).sum())
+        plot = plot[plot["Total_Lifetime_Spend"].gt(0)]
         if omitted:
             st.caption(f'{omitted:,} non-positive-spend customers omitted from the log chart, not from summaries.')
+
+    # --- Portfolio KPIs before chart ---
+    eligible_n = int((
+        view["Average_InterPurchase_Time_AIPT"].gt(0)
+        & view["Churn_Risk_Index_CRI"].ge(0)
+        & view["Total_Lifetime_Spend"].ge(0)
+    ).sum())
+
+    candidate_spend = candidates["Total_Lifetime_Spend"].sum(min_count=1)
+    candidate_share = (
+        len(candidates) / eligible_n if eligible_n else np.nan
+    )
+
+    cards = st.columns(3)
+    cards[0].metric("Outreach-test candidates", f"{len(candidates):,}")
+    cards[1].metric(
+        "Candidate observed spend",
+        f"{currency} {candidate_spend:,.0f}"
+        if pd.notna(candidate_spend) else "N/A",
+    )
+    cards[2].metric(
+        "Share of eligible repeat buyers",
+        f"{candidate_share:.1%}" if pd.notna(candidate_share) else "N/A",
+    )
+
+    st.caption(
+        "Counts cover selected segments; the value threshold uses the full base. "
+        "Candidate spend is historical—not revenue predicted to be lost."
+    )
+
+    if not np.isfinite(threshold):
+        st.info(
+            "No valid repeat-buyer spend benchmark is available. "
+            "High-value candidate classification is unavailable."
+        )
+
+    # --- Chart ---
     ids = set()
     if not plot.empty:
         # WebGL rendering for responsiveness
-        fig = px.scatter(plot, x='Churn_Risk_Index_CRI', y='Total_Lifetime_Spend', color='Segment', symbol='History',
-            symbol_map={'Repeat history': 'circle', 'Insufficient history': 'x'}, color_discrete_map=colors,
-            category_orders={'Segment': order}, custom_data=['customer_id'], hover_name='customer_id',
-            hover_data={'Recency_Days': True, 'Average_Order_Value_AOV': ':,.2f', 'Average_InterPurchase_Time_AIPT': ':.1f', 'Total_Lifetime_Spend': ':,.2f'},
-            labels={'Churn_Risk_Index_CRI': 'Purchase delay', 'Total_Lifetime_Spend': 'Observed spend ($)'}, log_y=log, opacity=.65,
-            render_mode='webgl')
-        for x, title in [(1, 'On cadence'), (2, '2× cadence'), (3, '3× cadence')]:
-            fig.add_vline(x=x, line_dash='dot', annotation_text=title)
-        if np.isfinite(threshold) and (not log or threshold > 0):
-            fig.add_hline(y=threshold, line_dash='dot', annotation_text=f'Full-base repeat-buyer P{percentile}: ${threshold:,.0f}')
-        
-        # Priority zone: high spend + delay >= 2
-        if np.isfinite(threshold):
-            x_max = plot['Churn_Risk_Index_CRI'].max() if not plot.empty else 5
-            x_max = max(x_max, 3)
-            y_max = plot['Total_Lifetime_Spend'].max() if not plot.empty else threshold * 10
-            if log:
-                y_max = y_max if np.isfinite(y_max) and y_max > threshold else threshold * 10
-            
-            fig.add_shape(
-                type='rect',
-                x0=2, x1=x_max, y0=threshold, y1=y_max,
-                fillcolor='rgba(239, 85, 59, 0.08)',
-                line=dict(width=1, color='#EF553B', dash='dash'),
-                layer='below',
+        fig = px.scatter(
+            plot, x="Churn_Risk_Index_CRI", y="Total_Lifetime_Spend", color="Segment", symbol="History",
+            symbol_map={"Repeat history": "circle", "Insufficient history": "x"},
+            color_discrete_map=colors,
+            category_orders={"Segment": order},
+            custom_data=["customer_id"],
+            hover_name="customer_id",
+            hover_data={
+                "Recency_Days": True,
+                "Average_Order_Value_AOV": ":,.2f",
+                "Average_InterPurchase_Time_AIPT": ":.1f",
+                "Total_Lifetime_Spend": ":,.2f",
+            },
+            labels={
+                "Churn_Risk_Index_CRI": "Purchase delay relative to usual cadence (×)",
+                "Total_Lifetime_Spend": f"Observed spend ({currency})",
+            },
+            log_y=log,
+            opacity=0.65,
+            render_mode="webgl",
+        )
+
+        for x, title in [(1, "On cadence"), (2, "2× cadence"), (3, "3× cadence")]:
+            fig.add_vline(x=x, line_dash="dot", annotation_text=title)
+
+        threshold_visible = np.isfinite(threshold) and (not log or threshold > 0)
+
+        if threshold_visible:
+            fig.add_hline(
+                y=threshold,
+                line_dash="dot",
+                line_color="#64748B",
             )
             fig.add_annotation(
-                x=2.1, y=threshold * (1.2 if not log else 1.5),
-                text='Priority outreach zone',
+                x=0.01,
+                xref="paper",
+                y=np.log10(threshold) if log else threshold,
+                yref="y",
+                text=f"Full-base repeat-buyer P{percentile}: {currency} {threshold:,.0f}",
                 showarrow=False,
-                font=dict(size=11, color='#EF553B'),
-                xanchor='left', yanchor='bottom',
-                bgcolor='rgba(255,255,255,0.9)',
-                bordercolor='#EF553B',
-                borderwidth=1,
+                xanchor="left",
+                yanchor="bottom",
+                bgcolor="rgba(255,255,255,0.9)",
             )
-        
-        fig.update_layout(height=550, dragmode='lasso', yaxis=dict(automargin=True))
-        signature = f'{source_fingerprint}|{selected}|{percentile}|{log}|{show_history}'
-        key = 'risk_' + hashlib.sha256(signature.encode()).hexdigest()[:12]
-        if 'on_select' in inspect.signature(st.plotly_chart).parameters:
-            event = st.plotly_chart(fig, use_container_width=True, key=key, on_select='rerun', selection_mode=('points', 'box', 'lasso'), theme=None)
+
+        # Outreach-test candidate region (only when threshold is visible and candidates exist in plot)
+        if threshold_visible and not candidates.empty:
+            x_max = plot["Churn_Risk_Index_CRI"].max()
+            x_max = max(x_max, delay_cutoff + 1)
+            y_max = plot["Total_Lifetime_Spend"].max()
+
+            fig.add_shape(
+                type="rect",
+                x0=delay_cutoff, x1=x_max, y0=threshold, y1=y_max,
+                fillcolor="rgba(239, 85, 59, 0.08)",
+                line=dict(width=1, color="#EF553B", dash="dash"),
+                layer="below",
+            )
+            fig.add_annotation(
+                x=0.99, y=0.99,
+                xref="paper", yref="paper",
+                text=f"Outreach-test candidates: delay ≥ {delay_cutoff:g}×",
+                showarrow=False,
+                xanchor="right",
+                yanchor="top",
+                bgcolor="rgba(255,255,255,0.9)",
+                font=dict(color="#B45309", size=11),
+            )
+
+        # WebGL marker and layout polish
+        fig.update_traces(
+            marker=dict(size=6),
+            selector=dict(type="scattergl"),
+        )
+
+        fig.update_layout(
+            height=580,
+            dragmode="lasso",
+            hovermode="closest",
+            legend=dict(
+                orientation="h",
+                x=0, y=-0.18,
+                xanchor="left", yanchor="top",
+                title_text="",
+            ),
+            margin=dict(l=55, r=25, t=45, b=130),
+        )
+
+        fig.update_xaxes(title="Purchase delay relative to usual cadence (×)")
+        fig.update_yaxes(title=f"Observed spend ({currency})")
+
+        # Signature includes new analytical controls
+        signature = f"{source_fingerprint}|{selected}|{percentile}|{delay_cutoff}|{log}|{show_history}"
+        key = "risk_" + hashlib.sha256(signature.encode()).hexdigest()[:12]
+
+        if "on_select" in inspect.signature(st.plotly_chart).parameters:
+            event = st.plotly_chart(
+                fig, use_container_width=True, key=key,
+                on_select="rerun", selection_mode=("points", "box", "lasso"), theme=None
+            )
             ids = selected_customer_ids(event.selection.points)
         else:
             st.plotly_chart(fig, use_container_width=True, theme=None)
-            st.caption('Upgrade to Streamlit >=1.35 for selection; default targets are shown below.')
+            st.caption("Upgrade to Streamlit >=1.35 for selection; default targets are shown below.")
     else:
-        st.info('No plottable customers with these settings. Change the log/history options.')
-    st.caption('Crosses at x=0 mean insufficient repeat history; zero is only a plotting convention, not a delay estimate.')
-    if ids:
-        targets = view[view['customer_id'].isin(ids)].copy()
-        st.subheader(f'Selected customers: {len(targets):,}')
-        st.caption(f"Observed spend: ${targets['Total_Lifetime_Spend'].sum():,.0f}")
+        st.info("No plottable customers with these settings. Change the log/history options.")
+
+    st.caption(
+        "Crosses at x=0 mean insufficient repeat history; zero is only a plotting convention, not a delay estimate."
+    )
+
+    # --- Explicit table source ---
+    table_mode = st.radio(
+        "Customers to inspect",
+        ["Rule-based candidates", "Chart selection"],
+        horizontal=True,
+        key="risk_table_mode",
+    )
+
+    if table_mode == "Chart selection":
+        targets = view.loc[view["customer_id"].isin(ids)].copy()
+        if targets.empty:
+            st.info("Select points using the box or lasso tool.")
     else:
-        targets = view[view['Average_InterPurchase_Time_AIPT'].gt(0) & view['Churn_Risk_Index_CRI'].ge(2) & view['Total_Lifetime_Spend'].ge(threshold)].nlargest(20, 'Total_Lifetime_Spend')
-        st.subheader('Top targets: high observed spend and purchase delay')
-        st.caption('Default: up to 20 repeat buyers with delay ≥2 and spend at or above the full-base repeat-buyer threshold.')
+        targets = candidates.nlargest(20, "Total_Lifetime_Spend")
+        st.caption(
+            f"Showing the top {len(targets):,} of {len(candidates):,} candidates "
+            "by observed spend."
+        )
+
     if targets.empty:
-        st.info('No customers meet these criteria.')
+        st.info("No customers meet these criteria.")
     else:
-        columns = ['customer_id', 'Segment', 'Total_Lifetime_Spend', 'Churn_Risk_Index_CRI', 'Recency_Days', 'Average_Order_Value_AOV']
-        st.dataframe(targets[columns].reset_index(drop=True), use_container_width=True, column_config={
-            'Total_Lifetime_Spend': st.column_config.NumberColumn('Observed spend', format='$%.2f'),
-            'Average_Order_Value_AOV': st.column_config.NumberColumn('AOV', format='$%.2f'),
-            'Churn_Risk_Index_CRI': st.column_config.NumberColumn('Purchase delay', format='%.2f'),
-        })
+        columns = ["customer_id", "Segment", "Total_Lifetime_Spend", "Churn_Risk_Index_CRI", "Recency_Days", "Average_Order_Value_AOV"]
+        st.dataframe(
+            targets[columns].reset_index(drop=True),
+            use_container_width=True,
+            column_config={
+                "Total_Lifetime_Spend": st.column_config.NumberColumn(f"Observed spend ({currency})", format=f"{currency} %.2f"),
+                "Average_Order_Value_AOV": st.column_config.NumberColumn(f"AOV ({currency})", format=f"{currency} %.2f"),
+                "Churn_Risk_Index_CRI": st.column_config.NumberColumn("Purchase delay", format="%.2f"),
+            },
+        )
         # Download button
-        csv = targets[columns].to_csv(index=False).encode('utf-8')
+        csv = targets[columns].to_csv(index=False).encode("utf-8")
         st.download_button(
-            'Download targets (CSV)',
+            "Download targets (CSV)",
             data=csv,
-            file_name='risk_value_targets.csv',
-            mime='text/csv',
+            file_name="risk_value_targets.csv",
+            mime="text/csv",
         )
 
 

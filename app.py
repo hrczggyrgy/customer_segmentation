@@ -563,7 +563,7 @@ with tab_dna:
     )
 
 with tab1:
-    render_risk(customers, selected, colors, order, st.session_state.tx_fingerprint)
+    render_risk(customers, selected, colors, order, st.session_state.tx_fingerprint, currency="$")
 with tab2:
     render_profiles(customers, profiles, selected)
     render_zscore_small_multiples(customers, profiles, selected, colors, order)
