@@ -24,6 +24,7 @@ from purchase_inactivity import (
     prepare_transactions as prepare_inactivity_transactions,
 )
 from customer_segment_DNA import DNAConfig, render_segment_dna, feature_catalog
+from segment_migration import render_segment_migration
 
 logger = logging.getLogger(__name__)
 
@@ -560,6 +561,14 @@ with tab_dna:
         eligible_segments=selected,
         segment_labels=labels,
         key_prefix=f"segment_dna_{st.session_state.tx_fingerprint}",
+    )
+
+    st.divider()
+
+    render_segment_migration(
+        tx_df,
+        source_fingerprint=st.session_state.tx_fingerprint,
+        key_prefix="segment_dna_migration",
     )
 
 with tab1:
