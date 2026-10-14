@@ -119,11 +119,9 @@ REQUIRED_TX_COLUMNS = {
     "transaction_date", "price", "quantity",
 }
 
-# Optional columns that can be mapped if present
+# Optional columns that can be mapped if present (not already required)
 OPTIONAL_TX_COLUMNS = {
-    "product_description": "product_description",
-    "department": "department",
-    "category": "category",
+    # These are already in REQUIRED_TX_COLUMNS, so they're handled above
 }
 
 # Default column name suggestions for common variations
@@ -323,26 +321,6 @@ if uploaded_transactions is not None:
             )
             if selected:
                 final_mapping[req_col] = selected
-        
-        # Optional columns
-        with st.sidebar.expander("Optional columns"):
-            for opt_col in sorted(OPTIONAL_TX_COLUMNS.keys()):
-                default = suggested_mapping.get(opt_col, "")
-                options = [""] + detected_cols
-                try:
-                    default_idx = options.index(default) if default else 0
-                except ValueError:
-                    default_idx = 0
-                
-                selected = st.sidebar.selectbox(
-                    f"{opt_col} (optional)",
-                    options=options,
-                    index=default_idx,
-                    key=f"map_{opt_col}_{new_fp[:8]}",
-                    help=f"Select the column in your data that corresponds to '{opt_col}'"
-                )
-                if selected:
-                    final_mapping[opt_col] = selected
         
         # Apply mapping and validate
         mapped_df = apply_column_mapping(raw_df, final_mapping)
