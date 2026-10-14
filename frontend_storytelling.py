@@ -354,8 +354,25 @@ def render_risk(customers, selected, colors, order, source_fingerprint, currency
             help="Makes a wide range of spend values easier to inspect.",
         )
         show_history = st.checkbox(
-            "Show limited history", value=True, key="risk_history",
+            "Show limited history",
+            value=False,
+            key="risk_history",
+            help=(
+                "These customers have no positive observed purchase interval. "
+                "Their x=0 location is a display convention, not a delay estimate."
+            ),
         )
+        x_mode = st.radio(
+            "Purchase-delay scale",
+            ["Compressed", "Linear"],
+            horizontal=True,
+            key="risk_x_scale",
+            help=(
+                "Compressed uses log(1 + delay) to keep large ratios visible. "
+                "Tick labels and customer values remain in the original × units."
+            ),
+        )
+        compressed_x = x_mode == "Compressed"
 
     # --- Build narrow working frame with sanitized numerics ---
     numeric_cols = [
@@ -410,6 +427,20 @@ def render_risk(customers, selected, colors, order, source_fingerprint, currency
     )
     plot.loc[plot["History"].eq("Insufficient history"), "Churn_Risk_Index_CRI"] = 0
 
+    # X-axis transformation helper
+    def x_position(value):
+        return np.log1p(value) if compressed_x else value
+
+    # Build plotting column and display label
+    plot["Delay_plot"] = plot["Churn_Risk_Index_CRI"].apply(x_position)
+    plot["Delay_label"] = [
+        f"{value:,.2f}×" if history == "Repeat history" else "Not estimable"
+        for value, history in zip(
+            plot["Churn_Risk_Index_CRI"],
+            plot["History"],
+        )
+    ]
+
     if not show_history:
         plot = plot[plot["History"].eq("Repeat history")]
 
@@ -454,34 +485,101 @@ def render_risk(customers, selected, colors, order, source_fingerprint, currency
             "High-value candidate classification is unavailable."
         )
 
+    # Show limited-history count regardless of chart visibility
+    limited_n = int(view["Average_InterPurchase_Time_AIPT"].eq(0).sum())
+    if limited_n:
+        st.caption(
+            f"{limited_n:,} selected customers have insufficient repeat history. "
+            "They are not classified as low-delay customers."
+        )
+
     # --- Chart ---
     ids = set()
     if not plot.empty:
         # WebGL rendering for responsiveness
         fig = px.scatter(
-            plot, x="Churn_Risk_Index_CRI", y="Total_Lifetime_Spend", color="Segment", symbol="History",
-            symbol_map={"Repeat history": "circle", "Insufficient history": "x"},
+            plot,
+            x="Delay_plot",
+            y="Total_Lifetime_Spend",
+            color="Segment",
+            symbol="History",
+            symbol_map={
+                "Repeat history": "circle",
+                "Insufficient history": "x",
+            },
             color_discrete_map=colors,
             category_orders={"Segment": order},
-            custom_data=["customer_id"],
-            hover_name="customer_id",
-            hover_data={
-                "Recency_Days": True,
-                "Average_Order_Value_AOV": ":,.2f",
-                "Average_InterPurchase_Time_AIPT": ":.1f",
-                "Total_Lifetime_Spend": ":,.2f",
-            },
-            labels={
-                "Churn_Risk_Index_CRI": "Purchase delay relative to usual cadence (×)",
-                "Total_Lifetime_Spend": f"Observed spend ({currency})",
-            },
+            custom_data=[
+                "customer_id",
+                "Delay_label",
+                "Recency_Days",
+                "Average_InterPurchase_Time_AIPT",
+                "Total_Lifetime_Spend",
+                "Segment",
+            ],
             log_y=log,
-            opacity=0.65,
+            opacity=0.6,
             render_mode="webgl",
         )
 
-        for x, title in [(1, "On cadence"), (2, "2× cadence"), (3, "3× cadence")]:
-            fig.add_vline(x=x, line_dash="dot", annotation_text=title)
+        fig.update_traces(
+            marker=dict(size=6),
+            selector=dict(type="scattergl"),
+            hovertemplate=(
+                "Customer: %{customdata[0]}<br>"
+                "Segment: %{customdata[5]}<br>"
+                "Purchase delay: %{customdata[1]}<br>"
+                "Days since last purchase: %{customdata[2]:,.0f}<br>"
+                "Average purchase interval: %{customdata[3]:,.1f} days<br>"
+                f"Observed spend: {currency} %{customdata[4]:,.2f}"
+                "<extra></extra>"
+            ),
+        )
+
+        # Build tick positions and labels for x-axis
+        base_delay = work.loc[
+            work["Average_InterPurchase_Time_AIPT"].gt(0)
+            & work["Churn_Risk_Index_CRI"].ge(0),
+            "Churn_Risk_Index_CRI",
+        ].dropna()
+
+        base_max = float(base_delay.max()) if not base_delay.empty else 0.0
+        axis_max = max(3.0, delay_cutoff, base_max)
+
+        ticks = [0, 0.5, 1, 2, 3, 5]
+
+        decade = 10.0
+        while decade <= axis_max:
+            ticks.extend([decade, 3 * decade])
+            decade *= 10
+
+        ticks = sorted({
+            float(t) for t in ticks if t <= axis_max
+        } | {float(delay_cutoff)})
+
+        fig.update_xaxes(
+            type="linear",
+            range=[0, float(x_position(axis_max)) * 1.04],
+            tickmode="array",
+            tickvals=[float(x_position(t)) for t in ticks],
+            ticktext=[f"{t:g}×" for t in ticks],
+            title=(
+                "Purchase delay (× usual interval; compressed spacing)"
+                if compressed_x
+                else "Purchase delay (× usual interval)"
+            ),
+        )
+
+        for value, label in [
+            (1.0, "1× usual interval"),
+            (float(delay_cutoff), "Candidate cutoff"),
+        ]:
+            fig.add_vline(
+                x=float(x_position(value)),
+                line_dash="dot",
+                line_color="#64748B",
+                annotation_text=label,
+            )
 
         threshold_visible = np.isfinite(threshold) and (not log or threshold > 0)
 
@@ -503,35 +601,24 @@ def render_risk(customers, selected, colors, order, source_fingerprint, currency
                 bgcolor="rgba(255,255,255,0.9)",
             )
 
-        # Outreach-test candidate region (only when threshold is visible and candidates exist in plot)
-        if threshold_visible and not candidates.empty:
-            x_max = plot["Churn_Risk_Index_CRI"].max()
-            x_max = max(x_max, delay_cutoff + 1)
-            y_max = plot["Total_Lifetime_Spend"].max()
+        # Outreach-test candidate region
+        plotted_candidates = (
+            plot["History"].eq("Repeat history")
+            & plot["Churn_Risk_Index_CRI"].ge(delay_cutoff)
+            & plot["Total_Lifetime_Spend"].ge(threshold)
+        )
 
+        if threshold_visible and plotted_candidates.any():
             fig.add_shape(
                 type="rect",
-                x0=delay_cutoff, x1=x_max, y0=threshold, y1=y_max,
-                fillcolor="rgba(239, 85, 59, 0.08)",
+                x0=float(x_position(delay_cutoff)),
+                x1=float(x_position(axis_max)),
+                y0=float(threshold),
+                y1=float(plot["Total_Lifetime_Spend"].max()),
+                fillcolor="rgba(239,85,59,0.06)",
                 line=dict(width=1, color="#EF553B", dash="dash"),
                 layer="below",
             )
-            fig.add_annotation(
-                x=0.99, y=0.99,
-                xref="paper", yref="paper",
-                text=f"Outreach-test candidates: delay ≥ {delay_cutoff:g}×",
-                showarrow=False,
-                xanchor="right",
-                yanchor="top",
-                bgcolor="rgba(255,255,255,0.9)",
-                font=dict(color="#B45309", size=11),
-            )
-
-        # WebGL marker and layout polish
-        fig.update_traces(
-            marker=dict(size=6),
-            selector=dict(type="scattergl"),
-        )
 
         fig.update_layout(
             height=580,
@@ -546,11 +633,10 @@ def render_risk(customers, selected, colors, order, source_fingerprint, currency
             margin=dict(l=55, r=25, t=45, b=130),
         )
 
-        fig.update_xaxes(title="Purchase delay relative to usual cadence (×)")
         fig.update_yaxes(title=f"Observed spend ({currency})")
 
-        # Signature includes new analytical controls
-        signature = f"{source_fingerprint}|{selected}|{percentile}|{delay_cutoff}|{log}|{show_history}"
+        # Signature includes x_mode
+        signature = f"{source_fingerprint}|{selected}|{percentile}|{delay_cutoff}|{log}|{show_history}|{x_mode}"
         key = "risk_" + hashlib.sha256(signature.encode()).hexdigest()[:12]
 
         if "on_select" in inspect.signature(st.plotly_chart).parameters:
@@ -566,8 +652,39 @@ def render_risk(customers, selected, colors, order, source_fingerprint, currency
         st.info("No plottable customers with these settings. Change the log/history options.")
 
     st.caption(
-        "Crosses at x=0 mean insufficient repeat history; zero is only a plotting convention, not a delay estimate."
+        "Compressed spacing preserves customer order and original delay values. "
+        "Equal distances do not represent equal increases in delay. "
+        "1× means recency equals the observed average purchase interval; "
+        "this is descriptive timing, not a churn probability."
     )
+
+    # --- Extreme tail diagnostic ---
+    with st.expander("Inspect extreme purchase-delay ratios"):
+        diagnostics = view.loc[
+            view["Average_InterPurchase_Time_AIPT"].gt(0)
+            & view["Churn_Risk_Index_CRI"].ge(0),
+            [
+                "customer_id",
+                "Segment",
+                "Churn_Risk_Index_CRI",
+                "Recency_Days",
+                "Average_InterPurchase_Time_AIPT",
+                "Total_Lifetime_Spend",
+            ],
+        ]
+
+        if diagnostics.empty:
+            st.info("No valid repeat-buyer delay values in selected segments.")
+        else:
+            st.dataframe(
+                diagnostics.nlargest(10, "Churn_Risk_Index_CRI"),
+                hide_index=True,
+                use_container_width=True,
+            )
+            st.caption(
+                "Extreme delay ratios are retained. Inspect both recency and "
+                "the purchase-interval denominator before interpreting them."
+            )
 
     # --- Explicit table source ---
     table_mode = st.radio(

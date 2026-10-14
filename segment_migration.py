@@ -570,8 +570,12 @@ def render_segment_migration(
         st.session_state[range_key] = None
     
     # Get date range from transactions
-    min_dt = tx_df.select(pl.col('transaction_date').min()).collect().item()
-    max_dt = tx_df.select(pl.col('transaction_date').max()).collect().item()
+    if isinstance(tx_df, pl.LazyFrame):
+        min_dt = tx_df.select(pl.col('transaction_date').min()).collect().item()
+        max_dt = tx_df.select(pl.col('transaction_date').max()).collect().item()
+    else:
+        min_dt = tx_df.select(pl.col('transaction_date').min()).item()
+        max_dt = tx_df.select(pl.col('transaction_date').max()).item()
     
     # Date range selector
     col1, col2 = st.columns(2)
