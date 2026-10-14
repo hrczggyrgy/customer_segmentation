@@ -107,18 +107,33 @@ flowchart TB
 
 ## Dashboard
 
-- Customer share versus observed-spend share with stable full-base denominators.
+- Customer share versus observed-spend share with stable full-base denominators,
+  plus a spend contribution index and percentage-point gap for the leading segment.
 - Behavior-derived segment descriptions retaining cluster IDs and consistent colors.
 - Benchmark heatmaps with sample sizes, raw-value hover, and fixed color bounds.
+- Segment differentiator cards: up to three traits per segment (at least 0.25
+  full-base standard deviations), each with direction, raw segment and full-base
+  averages with units, and a feature-specific interpretation based on the
+  definitions in `segmentation.py`. These are descriptive, not significance tests.
 - Risk-value scatterplots with point/box/lasso selection and customer-ID drill-down.
-- Distribution plots, optional normalized radar profiles, PCA projections,
-  actual explained variance and signed component loadings.
-- On-demand monthly repeat-purchase retention with a visible finalized cutoff.
+- Distributions with a Boxplot (default) / Violin plot selector, optional log axis
+  (omitted non-positive values are counted; summary statistics keep them), and
+  optional normalized radar profiles.
+- PCA projections (PC1 vs PC2, PC1 vs PC3, 3D) with explained-variance percentages
+  in axis labels when fingerprint-matched metadata is valid, labeled segment
+  centers (mean PC coordinates), explained-variance chart, and signed loadings.
+- On-demand monthly repeat-purchase retention with a visible finalized cutoff,
+  cohort starting customer counts in row labels, and hover details (cohort, month,
+  retention %, retained customers).
 
-Historical spend is not predicted lifetime value. Purchase delay is not a
-calibrated churn probability. Marketing actions are hypotheses for experiments.
-Cluster IDs, cluster counts, and descriptive labels may change with the dataset.
-Previous example results are dataset-specific, not guaranteed outcomes.
+## Observed behavior, hypotheses, and predictions
+
+Observed behavior is what the uploaded transactions show (spend, recency,
+cadence, retention). Segment labels and action hypotheses are ideas to test, not
+validated recommendations. The dashboard makes no predictions: historical spend is
+not predicted lifetime value, and purchase delay is not a calibrated churn
+probability. Cluster IDs, cluster counts, and descriptive labels may change with
+the dataset. Previous example results are dataset-specific, not guaranteed outcomes.
 
 ## Data identity and deployment behavior
 
@@ -128,10 +143,11 @@ fingerprints even if their logical rows match. Legacy 16-character fingerprints
 are not silently treated as equivalent; regenerate old artifacts when needed.
 
 The dashboard keeps transaction data, segment assignments, PCA metadata, and
-retention results in session state. It does not read or write generated segment
-or metadata files and does not place these results in a shared Streamlit cache.
-Refreshing reuses only matching results within that session; force regeneration
-recomputes only that session. Disconnecting/reloading can lose session results.
+retention results (including cohort sizes) in session state. It does not read or
+write generated segment or metadata files and does not place these results in a
+shared Streamlit cache. Refreshing reuses only matching results within that
+session; force regeneration recomputes only that session. Disconnecting/reloading
+can lose session results.
 
 `python segmentation.py` remains a controlled offline workflow that writes
 `customer_segments_advanced.parquet` and `pca_metadata.json` with a full source
@@ -149,11 +165,11 @@ transaction falls on month-end. Earlier months are assumed complete. When source
 completeness is known, enable the confirmed data-complete-through date. Only
 whole calendar months ending on or before that date are finalized.
 
-Unfinished periods are null; observed periods with no returning customers are
-0%. Cohorts after the cutoff are excluded. Missing observed period columns are
-created as zero rather than silently omitted. Month 1/3 summaries average eligible
-cohorts equally and exclude nulls. The last transaction date alone cannot prove
-source completeness.
+Unfinished periods are null (blank cells); observed periods with no returning
+customers are 0%. Cohorts after the cutoff are excluded. Row labels show each
+cohort's starting count of distinct customer IDs from the full base, independent
+of segment filters. Month 1/3 summaries average eligible cohorts equally and
+exclude nulls. The last transaction date alone cannot prove source completeness.
 
 ## Run
 
